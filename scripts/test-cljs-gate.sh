@@ -27,7 +27,14 @@ mkdir -p "$LOG_ROOT"
 
 # Harness | test namespace.  Keep the browser harness last: it drives a real
 # Chromium page and is the slowest, most environment-sensitive item.
+#
+# The negative gate is first because it is the only item that validates the
+# runners themselves: it feeds a deliberately failing namespace through
+# test/js/run_schedule_ui_tests.cjs and asserts the process exit code is
+# non-zero.  Its own exit 0 means "the failure was detected", so it participates
+# here as an ordinary PASS/FAIL check (D-42).
 HARNESSES="$(cat <<'EOF'
+test/js/verify_negative_gate.sh|hc.test.always-fails-test
 test/js/verify_artifacts_ui.sh|hc.client.artifacts.ui-test
 test/js/verify_backup_password_dom.sh|hc.client.backup.password-dom-test
 test/js/verify_conversation_selection_dom.sh|hc.client.conversation.selection-dom-test
