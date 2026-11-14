@@ -48,6 +48,7 @@
 - **两个候选字段的判定**：
   - `:tool-call-ids` 有 3 处读者。`guards.clj:455` 只问 `(seq (:tool-call-ids run))`——一个**非空性**判断，且它的扫描**没有** `:status` 过滤，所以确实会看终态 run，但只需要「是否非空」这一位。`handlers.clj:2088` 用 ids 的**内容**去反查工具名，但只在构造当前轮 turn 汇总时用。`handlers.clj:2121` 是写入方。因此终态 run 只需保留一个「有工具证据」的布尔，内容可外置。
   - `:context` 在 `state.clj:894` 由 `start-run` 从 call 复制进 run；全部 20 处 `:context` 命中都在讨论 agent 私有上下文（另一概念）或 call 的 context，没有一处读**run** 的 `:context`。判定：终态后无活读者，可外置。
+- **实施位置**：`compact.clj` 的 `compact-value` 对 `:context` 既不外置（不在 `large-keys`）也不递归（不在 `recursive-keys`），所以原样保留；缩身必须是一个**独立步骤**，与 `collapse-run-text` 并列，由 `compact-state` 或 store 装饰器在每次提交时调用。不要试图通过往 `large-keys` 里加字段来实现——那些字段单条都很小，`max-inline-chars`（1024）永远达不到阈值，加了也不生效。
 - **实测收益**：按「保留 `:run-id :call-id :attempt-id :status :finished-at :started-at :message-id :text :text-length`，并把 `:tool-call-ids` 压成一个 `:had-tools?` 布尔」模拟缩身，在 100/200/400/800 轮上稳定省下 `:runs` 区的 **60%**，即整文档的 **18%**。800 轮从 1 498 032 降到 1 227 052 字符（省 270 980）。已经过 `collapse-run-text` 的长会话同样省 60%（225 361 → 89 981）。这是 D-37 系列里单位收益最高的一刀，且不需要碰 `:conversation` 的任何契约。
 - **建议方向**：把终态 run 折叠为「身份 + 终态 + 时间 + 计数 + 是否有工具证据」的最小集，把 `:context` 与 `:tool-call-ids` 明细外置到 blob 区（与 `:calls` 的 `:request :snapshot` 同一机制）。保守估计可去掉 460 字符/条 中的大部分。**必须先跑完整读者普查**：本条目只做了静态阅读，`test/` 下对 `:runs` 的直接断言（`compact_test.clj:40`、`run_text_window_test.clj:41`、`attempt_id_normalization_test.clj:48`、`handlers_test.clj:1285`）会受影响，须逐个判定是锁行为还是锁字段。
 - **触发条件**：任何会话进入 300 轮以上；或单次提交观测到文档超过 400 KB。
