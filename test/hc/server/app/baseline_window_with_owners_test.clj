@@ -152,7 +152,7 @@
     (is (= (set (:message/order baseline))
            (published-ids baseline)))
     (is (= "entry 9" (get-in baseline [:message/by-id "message-9" :text]))
-        "the id still names the same entry"))))
+        "the id still names the same entry")))
 
 (deftest the-histories-path-alone-honours-the-window
   (testing "without owner snapshots the window works, which is why the defect hid"
