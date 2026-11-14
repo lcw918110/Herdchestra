@@ -62,5 +62,9 @@
   `test/hc/server/app/lazy_owner_test.clj:203` 的 `baseline-publishes-the-active-window-and-no-inactive-entities` 之所以通过，是因为它传 `:owner-snapshots {}`，`visible-owners` 为空，`conversations` 自然为空。一旦有 owner snapshot，全量路径就接管。**测试没有覆盖有 owner snapshot 的情形。**`inactive-history-window-size` 的 docstring 明写「Default to 0, so a large session list publishes no entities for sessions nobody opened」，但该意图只对 `:session-records` 生效。
 - **影响**：一个 500 轮会话在每次快照里都下发完整历史，即使客户端只打开一个会话；用户没打开的会话也全量下发。这与 §8.5 的「打开列表按需渲染」直接冲突。
 - **窗口化的已知陷阱**：`conversation-view` 经 `normalize-message` → `message-id` 计算每条消息的 id，最后一级回退是 `(str "message-" index)`，而 `index` 是**投影后向量里的位置**。一旦丢掉前缀，没有显式 id 的消息会整体改变 id；客户端看到的是身份全换而非增量追加，且 `:published-windows` 记录的旧 id 集合再也匹配不上，窗口逻辑会静默退化成「发布全部」。真实条目都带稳定 `:message-id`（`put-assistant` 写入 `"assistant-<call-id>-<attempt-id>"`），但该回退路径必须被证明不可达，或被改成保留原始下标。
+- **两条路径的数据源不同，不能简单删掉其中一条**：`conversations` 源自 `(:conversation state)`（活跃 Owner 会话的**在途**对话），`histories` 源自 `:session-records`（**已持久化**的会话记录）。前者携带尚未落盘的流式 assistant 消息，正是客户端在模型说话时要渲染的那条。删掉 `conversations` 会让流式回答从快照里消失。所以只能给它**加窗口**，不能移除。
+- **窗口必须在投影之前**：`conversation-view` 只在 `snapshot.clj:854`（带缓存分支）与 `:860`（无缓存分支）被调用，两处都走 `normalize-message` 的 `(str "message-" index)` 末级回退。因此要先把 `:conversation` 向量按 id 集合收窄**再**传入，不能对 `conversation-view` 的输出收窄——后者会重新生成 id。
+- **窗口还必须与 `histories` 一致**：`history-window-ids` 已能从 `published-windows` + `window-size` 算出某会话的 id 集合。直接复用它的结果过滤该会话的 conversation 条目，否则 merge 看到同一会话的两个不同尾巴，并集仍然错。
+- **缓存键要带上窗口**：`:854` 的缓存以 `(:version owner)` 为键，不含窗口。若在缓存调用前收窄，必须把窗口并进键，否则第一个发布者的窗口会永久生效。`history-window-key` 就是为这个存在，照抄即可。
 - **建议方向**：把两个窗口参数同样应用到 `conversations` 路径，并同步过滤 `:message/order`（客户端硬不变量：`:message/order` 必须恰好列出 `:message/by-id` 的全部键各一次，见 `src/hc/client/sync/AGENTS.md:230`）。窗口化必须保留原始下标，不能重排 `:conversation` 顺序。
 - **触发条件**：任何会话超过 `history-window-size`，或可见会话数超过 10。
