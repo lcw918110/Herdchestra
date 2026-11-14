@@ -4,25 +4,14 @@
 
 编号不重排、不复用：已关闭条目（如 D-01、D-02、D-03、D-04、D-05、D-06、D-08–D-12、D-13–D-20、D-22、D-23、D-32）从本文件删除；历史状态见 git 历史与 `plans/debt-status-0.0.1.md`。新增条目从 D-38 起连续编号（D-38–D-46 已占用；D-32、D-38 已关闭但编号不复用）。
 
-## D-33 单会话 64 MiB artifact 累计上限在捕获阶段未知剩余预算
-
-- **条款**：`AGENTS.md` §7.2（artifact 64 MiB 上限）与附录 §8.6 产物提交流程。
-- **缺口**：`src/hc/server/artifacts/registry.clj:505-555` 的 `ensure-session-capacity!` 只在登记时检查会话累计字节；`src/hc/server/artifacts/integration.clj:115-120` 把 `:max-bytes` 与 `:session-limit-bytes` 都设为同一个上限；`src/hc/server/shell/output.clj:21-23,63-80` 的捕获器只接收单 artifact 的 `:artifact-limit`，不知道本会话已用掉多少。捕获仍可能写出一份必然在登记时被 `:ARTIFACT_SESSION_LIMIT` 拒绝的文件。
-- **影响**：用户付出等待后拿不到产物；临时文件与诊断更嘈杂，且截断/拒绝发生得过晚。
-- **建议**：把会话剩余预算传入捕获器（或由捕获器先查询现有字节），在写入前截断/拒绝并给明确理由；登记仍保留最终权威检查。
-
-## D-37 Owner chunk 未合并，`:calls`/`:conversation`/`:receipts` 无按条数保留策略
+## D-37 `:conversation` / `:calls` / `:runs` 无保留策略，流式 chunk 逐条提交
 
 - **条款**：`AGENTS.md` §5.1（单 Owner 状态迁移）、§6.1（流式阅读）与 §8.4 变更检查表。
-- **缺口**：`src/hc/compose/owner/AGENTS.md:1016-1026` 仍记录两项缺口：每个流式 chunk 逐次提交（未在 `deliver!` 前合并相邻 chunk，`src/hc/compose/owner/handlers.clj:511-515`、`state.clj:874-878` 仍是单 chunk 追加）；`:calls`、`:conversation`、`:receipts` 随会话增长，没有按条数/世代的保留或折叠策略。新增的 `src/hc/compose/owner/compact.clj` 与 `runtime.clj:369-380` 只在大状态超过阈值时压缩长字符串/回执载荷，不限制条目数量，也不改变 chunk 提交粒度。
-- **影响**：长流式回合放大持久层写放大；长会话的 Owner 整态 CAS 会越来越慢，最终逼近文档大小/提交成本边界。
-- **建议**：在 dispatch 的末端按时间窗或字节阈值合并相邻 chunk，一次提交一个合并块；为 `:calls`/`:conversation`/`:receipts` 定义显式保留/折叠策略（保留权威回执与未结调用，折叠已结算的细粒度记录），并保留现有按大小的 payload 压缩作为独立层。
-
-## D-47 devops worker 内部的 shell 动作不进 Owner 调用账本
-
-- **条款**：`AGENTS.md` §5.3（未结责任与 `:outcome-unknown` 恢复窗口）、§4.4（`.call` 会话边界）。
-- **位置**：`src/hc/server/app/devops.clj:121-126` 与 `src/hc/server/app/system.clj:2381-2395` 的 `call` helper 同步执行 shell；`src/hc/compose/owner/state.clj:1631-1660` 的 `recover-state` 只把 Owner 账本里 `:dispatching`/`:running` 的 call 标为 `:outcome-unknown`；`src/hc/server/app/snapshot.clj:308-327` 只发布这些 call。
-- **缺口**：Plan dedicated worker 通过 `call` 工具启动的 shell 会话不写入 Owner 的 `:calls`。JVM 被 SIGKILL 时，worker 的 shell 确实在途，但重启后没有任何记录可标 `:outcome-unknown`，「结果待确认」面板不会出现。
-- **影响**：worker 侧的外部副作用在硬崩溃后失去可核对入口，与 §5.3「可能产生外部副作用的 Shell 结果未知时优先核对」不一致。E2E 10 因此只能靠 Plan 顶层 `clj-plan` 的 call 记录来间接覆盖。
-- **建议**：让 devops worker 的 `call` 也登记为 Owner 可恢复的动作（或让 worker 会话把在途 shell 事实汇报给父 Owner），使 `recover-state` 能覆盖它；同时补一条针对该路径的验收。
-- **优先级**：中；当前 E2E 10 已用顶层 call 覆盖同类语义，但 worker 路径本身仍是盲区。
+- **已关闭的部分**：`:receipts` 的无限增长已在 `752060a` 关闭——窗口满时用 `:COMMAND_RECEIPT_WINDOW_FULL` + `:action :resync-state` 拒绝**新** command-id，重放与 payload 冲突仍走原语义，轮换 epoch 后窗口清空。默认上限 4096，可由 gate 文档的 `:max-receipts` 覆盖。
+- **剩余缺口（一）**：每个流式 chunk 仍逐条提交。`src/hc/compose/owner/dispatch.clj:301-312` 的 `deliver!` 对每个 provider 事件直接 `post!`，`state.clj:1002-1012` 的 `append-run-text` 每次追加都把整段文本重新 `str` 拼接并重写 assistant 消息。实测 2000 个 chunk 得到 14.9 KB 文本、33.9 KB 文档，写放大与 chunk 数成正比。
+- **剩余缺口（二）**：`:conversation`、`:calls`、`:runs` 随会话增长且无上限。实测 200 轮会话的 `:conversation` 已占 125 KB，整个 Owner 文档 128 KB。`src/hc/server/app/snapshot.clj:725-735` 的 window 只限制**发布**，不限制 Owner 文档本体。
+- **影响**：长会话的 Owner 整态 CAS 越来越慢，最终逼近存储文档大小与提交成本边界；长流式回合放大持久层写。
+- **不能直接裁剪的原因**：`:conversation` 是 Scope/Pair-Hint 的权威源，也是 sealed view 的切片来源（`hc.core.scope.runtime/conversation->items`、`hc.compose.owner.state/project-conversation`）。裁剪会改变出站提示词组合与前缀链，必须与 `:PREFIX_DRIFT` 语义、`reset-beats` 边界和接力屏障一起设计；`:calls` 中未结/未确认的记录不可丢弃。
+- **chunk 合并已试过，不能这样做**：曾在 `dispatch.clj` 的 `deliver!` 按 1 KiB 阈值合并相邻 chunk，`recovered` 前的一切都正确，但取消路径暴露了真实缺陷——Agent 的 buffer 由发送侧持有，而「Esc 停止」由 Owner 侧最终化。仅靠 `:completed`/`:failed` 前的 flush 无法覆盖取消：`hc.compose.owner.runtime-test` 的 `streaming-cancellation-finalizes-partial-content` 显示，取消时阈值以下的文本从未提交，用户已看到的半句会消失。因此该改动已整体撤销（逐条提交保证不丢字）。正确形态需要发送侧在取消时**同步**flush 并让 Owner 等待该 flush 落库，或把 buffer 移到 Owner 侧（跨消息聚合），两者都改变取消时序契约，必须单独设计并验收。
+- **建议**：先把 buffer 放进 Owner 状态（每 attempt 一个 `:pending-chunk` 字段），由 Owner 在每次消息里合并，取消时由 Owner 自己 finalize——这样不存在发送侧与 Owner 的 flush 竞态；再为 `:conversation` 定义显式折叠策略（保留 reset 边界之后的权威消息与密封窗口所需的切片，把更早的已结算消息折叠为摘要并保留可追溯引用），同步更新 Pair-Hint 链与 sealed-view 的验收。
+- **触发条件**：单会话 Owner 文档超过 1 MiB，或持久层 CAS 提交耗时超过 20 ms 时优先处理缺口（二）；出现流式回合卡顿时优先处理缺口（一）。
