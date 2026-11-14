@@ -353,3 +353,198 @@
                 :session-id nil
                 :kind :app-config
                 :id "config"})))))))
+
+;; ---------------------------------------------------------------------------
+;; Committed session count
+
+(defn- count-doc
+  [store]
+  (storage/read-document store
+                         {:partition "sessions"
+                          :session-id nil
+                          :kind :session-count
+                          :id "sessions"}))
+
+(deftest committed-session-count-is-constant-time-and-moves-with-the-index-test
+  (storage-support/with-temp-store [store {}]
+    (let [p (session-persistence/persistence store)]
+      (is (= 0 (:count (ports/committed-session-count p)))
+          "an empty store reports zero rather than unknown")
+      (is (nil? (count-doc store))
+          "an untouched store has no committed count yet")
+      (is (= 0 (:count (ports/committed-session-count p)))
+          "the adapter derives zero from the empty index instead of guessing")
+      (doseq [index (range 5)]
+        (let [session-id (str "s-count-" index)]
+          (is (= :committed
+                 (:status (ports/commit-session! p 0
+                                                 (sample-session
+                                                  session-id
+                                                  (str "o-count-" index)
+                                                  session-id)))))))
+      (is (= 5 (:count (ports/committed-session-count p))))
+      (is (= 5 (:count (count-doc store))))
+      (is (= 5 (count (:ids (ports/list-session-ids p))))
+          "the counter and the index agree")
+      (testing "an update does not change the count"
+        (let [stored (:session (ports/read-session p "s-count-0"))]
+          (is (= :committed
+                 (:status (ports/commit-session!
+                           p (:revision stored)
+                           (assoc stored :revision (inc (:revision stored))
+                                  :title "renamed"))))))
+        (is (= 5 (:count (ports/committed-session-count p)))))
+      (testing "a delete decrements in the same commit as the index"
+        (let [deleted (ports/delete-session! p 0 "s-count-1")]
+          (is (= :deleted (:status deleted)))
+          (is (= 4 (:count (ports/committed-session-count p))))
+          (is (= 4 (:count (count-doc store))))
+          (is (= 4 (count (:ids (ports/list-session-ids p)))))))
+      (testing "a session re-committed after a delete is counted once"
+        (is (= :committed
+               (:status (ports/commit-session! p 0
+                                               (sample-session
+                                                "s-count-1" "o-count-1"
+                                                "s-count-1")))))
+        (is (= 5 (:count (ports/committed-session-count p))))
+        (is (= 5 (count (:ids (ports/list-session-ids p)))))))))
+
+(deftest committed-session-count-stays-correct-at-a-thousand-sessions-test
+  (storage-support/with-temp-store [store {}]
+    (let [p (session-persistence/persistence store)
+          ids (mapv #(str "scale-count-" %) (range 1000))]
+      (doseq [[batch-index batch] (map-indexed vector (partition-all 100 ids))]
+        (let [migration-id (str "count-scale-" batch-index)
+              puts (mapv (fn [session-id]
+                           {:kind :session-record
+                            :id session-id
+                            :doc (sample-session session-id
+                                                 (str session-id "-owner")
+                                                 session-id)})
+                         batch)
+              all-ids (vec (take (* (inc batch-index) 100) ids))]
+          (is (:ok? (storage/commit-migration!
+                     store
+                     {:migration-id migration-id
+                      :partition "sessions"
+                      :lightweight-return? true
+                      :put (conj puts
+                                 {:kind :session-index
+                                  :id "sessions"
+                                  :doc {:id "sessions" :ids all-ids}}
+                                 {:kind :session-count
+                                  :id "sessions"
+                                  :doc {:id "sessions" :count (count all-ids)}})})))))
+      (is (= 1000 (:count (ports/committed-session-count p))))
+      (is (= 1000 (:count (count-doc store))))
+      (is (= 1000 (count (:ids (ports/list-session-ids p))))
+          "the maintained count equals the index length at 1000 sessions")
+      (testing "the count is a point read, not a scan"
+        (let [reads (atom [])
+              orig storage/read-document]
+          (with-redefs [storage/read-document
+                        (fn [target opts]
+                          (swap! reads conj opts)
+                          (orig target opts))]
+            (is (= 1000 (:count (ports/committed-session-count p)))))
+          (is (= [:session-count] (mapv :kind @reads))
+              "the adapter reads one count document and nothing else"))))))
+
+(deftest an-index-without-a-count-document-falls-back-to-the-index-length-test
+  (storage-support/with-temp-store [store {}]
+    (let [p (session-persistence/persistence store)]
+      ;; A store written before the count document existed (or restored from a
+      ;; package that dropped it) carries only the index.
+      (is (:ok? (storage/commit-migration!
+                 store
+                 {:migration-id "legacy-index"
+                  :partition "sessions"
+                  :lightweight-return? true
+                  :put [{:kind :session-record :id "legacy-1"
+                         :doc (sample-session "legacy-1" "o-legacy" "legacy")}
+                        {:kind :session-record :id "legacy-2"
+                         :doc (sample-session "legacy-2" "o-legacy" "legacy")}
+                        {:kind :session-index
+                         :id "sessions"
+                         :doc {:id "sessions" :ids ["legacy-1" "legacy-2"]}}]})))
+      (is (nil? (count-doc store)))
+      (is (= {:status :ok :count 2}
+             (ports/committed-session-count p))
+          "a missing count falls back to the index length, never to unknown")
+      (testing "the next commit writes the count again"
+        (is (= :committed
+               (:status (ports/commit-session! p 0
+                                               (sample-session
+                                                "legacy-3" "o-legacy-3"
+                                                "legacy")))))
+        (is (= 3 (:count (count-doc store))))
+        (is (= 3 (:count (ports/committed-session-count p))))))))
+
+(deftest a-failed-count-read-is-unknown-never-zero-test
+  (storage-support/with-temp-store [store {}]
+    (let [p (session-persistence/persistence store)]
+      (is (= :committed
+             (:status (ports/commit-session! p 0 (sample-session
+                                                  "s-count-boom" "o-count-boom"
+                                                  "boom")))))
+      (with-redefs [storage/read-document
+                    (fn [& _] (throw (ex-info "count unavailable" {})))]
+        (let [result (ports/committed-session-count p)]
+          (is (= :unknown (:status result)))
+          (is (not= 0 (:count result))))))))
+
+(deftest a-persistence-without-the-count-protocol-still-counts-test
+  (let [store (ports/memory-persistence)]
+    (is (= :committed
+           (:status (ports/commit-session! store 0
+                                           {:session-id "m-1" :revision 0}))))
+    (is (= {:status :ok :count 1} (ports/committed-session-count store)))
+    (is (= :deleted (:status (ports/delete-session! store 0 "m-1"))))
+    (is (= {:status :ok :count 0} (ports/committed-session-count store))))
+  (testing "an adapter without SessionCountRead falls back to the id list"
+    (let [store (reify ports/SessionPersistence
+                  (read-session [_ _] {:status :missing})
+                  (commit-session! [_ _ _] {:status :committed :revision 0})
+                  (list-session-ids [_] {:status :ok :ids ["a" "b" "c"]})
+                  (delete-session! [_ _ _] {:status :missing})
+                  (read-config [_] {:status :missing})
+                  (commit-config! [_ _ _] {:status :committed :revision 0}))]
+      (is (= {:status :ok :count 3} (ports/committed-session-count store)))))
+  (testing "a failing fallback list is unknown, never zero"
+    (let [store (reify ports/SessionPersistence
+                  (read-session [_ _] {:status :missing})
+                  (commit-session! [_ _ _] {:status :committed :revision 0})
+                  (list-session-ids [_] {:status :error
+                                         :error {:code :INDEX_UNAVAILABLE}})
+                  (delete-session! [_ _ _] {:status :missing})
+                  (read-config [_] {:status :missing})
+                  (commit-config! [_ _ _] {:status :committed :revision 0}))]
+      (is (= :unknown (:status (ports/committed-session-count store)))))))
+
+(deftest a-restore-rewrites-the-count-from-the-restored-index-test
+  (let [dir (storage-support/temp-dir "hc-count-restore-")]
+    (try
+      (let [source (storage/open-store {:path dir :create? true})]
+        (try
+          (let [p (session-persistence/persistence source)]
+            (doseq [index (range 3)]
+              (is (= :committed
+                     (:status (ports/commit-session! p 0
+                                                     (sample-session
+                                                      (str "rs-" index)
+                                                      (str "rs-o-" index)
+                                                      "restore"))))))
+            (let [package (storage/export-state source {})
+                  restored (storage/restore-state! source package
+                                                   {:migration-id
+                                                    "restore-count-check"
+                                                    :quiescent? true})]
+              (is (:ok? restored))
+              (is (= 3 (:count (count-doc source)))
+                  "a restore rewrites the count from the restored index")
+              (is (= 3 (:count (ports/committed-session-count p)))
+                  "the adapter still agrees with the index after a restore")))
+          (finally
+            (storage/close-store! source))))
+      (finally
+        (storage-support/delete-tree! dir)))))

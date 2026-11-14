@@ -1417,11 +1417,13 @@ HC_E2E_KEEP_TEMP=1 JAVA_HOME=$PWD/.pixi/envs/default/lib/jvm \
 `[CODE FACT，未复测]` 环境：`hc.server.app` 实时 health。
 
 - **现象**：`ok?` 只由 `store-open?` + 非 nil `gateway-stats` + 空
-  `component-errors` 决定；`session-count` 不在其中。计数走
-  `list-session-ids` 索引点读，nil/异常记 `{:count :unknown}`，绝不因此 503。
+  `component-errors` 决定；`session-count` 不在其中。计数读 `sessions` 分区
+  的 `:session-count` 文档（与 `:session-index` 同事务提交的单次点读），
+  读失败记 `{:count :unknown}`，绝不因此 503。见 §17.30。
 - **数值**：3 个就绪条件；`session-count` 为诊断字段，不是 readiness 条件。
 - **源码位置**：`src/hc/server/app/health.clj:29-40`；
-  `src/hc/server/app/system.clj:5166-5188`（`health-system`）与 `:5379-5390`。
+  `src/hc/server/app/system.clj:5869-5888`（`health-system`）与
+  `:6102-6120`（`system/health`）。
 - **复检命令**：
   ```bash
   pixi run app-check
@@ -1820,6 +1822,55 @@ HC_E2E_KEEP_TEMP=1 JAVA_HOME=$PWD/.pixi/envs/default/lib/jvm \
   占着跨 spec 比较键，却在回答另一个问题，比较必然误报。两处现在都改成
   `treeSha256: sourceTreeSha256()` 加独立命名的 `specCompositeSha256`。
   复检：`grep -rn "treeSha256Dual" test/` 应为空。
+
+### 17.30 `/healthz` 的 `session-count` 改为同事务计数文档（2026-11-14）
+
+`[实测，2026-11-14]` 环境：macOS 25.6.0 / arm64，Pixi `default` JDK 21，
+Datalevin 1.2.10；含 1000 条会话的临时库。本条关闭 `DEBT.md` D-41。
+
+- **现象（修前）**：`/healthz` 与 `system/health` 的 `:session-count` 调
+  `session-ports/list-session-ids`，把整个 `:session-index` 文档反序列化后
+  取 `count`。成本与索引条目线性：1000 会话实测中位 **0.594 ms**（含索引
+  文档解码），全量 `:ids` 列表每次都要分配。
+- **改法**：`sessions` 分区新增 `:session-count` 文档（`id "sessions"`，
+  doc `{:id "sessions" :count n}`），由 `session_persistence` 在
+  `commit-session!` / `delete-session!` / `storage/erase-session-derived!`
+  的**同一个 `commit-migration!`** 里与 `:session-index` 一起写入，因此二者
+  同事务：读者要么看到旧的 ids+count 对，要么看到新的，不会读到互相矛盾的
+  组合。健康端点改读 `ports/committed-session-count`（可选能力
+  `SessionCountRead`；适配器不实现时回退为索引长度）。
+- **数值（修后）**：同一 1000 会话库，`committed-session-count` 中位
+  **0.030 ms**（5 次：`0.0676 / 0.0354 / 0.0298 / 0.0256 / 0.0252` ms），
+  对照 `list-session-ids` 中位 **0.594 ms**，约 20 倍差距，且不再随会话数
+  增长（点读一份常量大小的文档）。1000 会话下 `:count` 与索引 `:ids`
+  长度均为 `1000`。
+- **测量口径**：`storage/read-document` 点读 + `long` 取值 vs
+  `session-index-state` 读取并 `vec`/`distinct` 全部 id。计时在 JVM 热身后
+  跑 5 次取中位，单位 ms，只覆盖持久化层，不含 HTTP 栈。
+- **阈值与降级**：稳定态没有预算上限；只在两种情况下退化为
+  `{:count :unknown}`——计数读取抛异常，或返回非 `:ok` 状态。
+  `health/snapshot` 的 `ok?` 不含 `session-count`，故计数不可得时 `/healthz`
+  仍 200、字段完整。旧库（有 `:session-index`、无 `:session-count`）与从
+  备份恢复后（restore 会丢弃并重算派生文档）走「点读索引 + 计 ids 长度」的
+  回退，仍是一次点读，不逐条读会话记录。
+- **源码位置**：`src/hc/server/app/session_persistence.clj`（`count-kind`、
+  `put-count`、`ports/SessionCountRead`）；`src/hc/server/sessions/ports.clj`
+  （`SessionCountRead`、`committed-session-count`）；`src/hc/server/storage.clj`
+  （`remove-session-index-entry!`、`restore-session-count-doc`、
+  `rebuilt-session-document-kinds`）；`src/hc/server/app/system.clj` 两处
+  `:session-count`（`health-system` 与 `health`）。
+- **复检命令**：
+  ```bash
+  clojure -M:dev:server -e \
+    "(require 'hc.server.app.system-test) (clojure.test/run-tests 'hc.server.app.system-test)"
+  ```
+  其中 `committed-session-count-is-point-read-and-follows-commits` 断言增删
+  后计数同步且读计数不物化 id 列表；
+  `committed-session-count-falls-back-to-a-legacy-index` 断言无计数文档时回退；
+  `healthz-degrades-a-failed-session-count-to-unknown` 让计数点读抛错后断言
+  `/healthz` 仍 200 且 `:sessions {:count :unknown}`。
+- **适用范围**：任何以会话数为诊断字段的只读探针；新增派生计数文档必须与
+  其权威索引同事务提交，否则计数会漂移。
 
 ## 18 E2E 06 的 fixture 依赖 Pillow 与跨平台字体（2026-11-11）
 

@@ -90,10 +90,15 @@
         (testing "memory candidates and session selections are gone"
           (is (= ["mem-keep"] (mapv :id (docs-of materials "materials")))))
         (testing "the session record, command and index entry are gone"
-          (is (not-any? #(= session-id (:id %)) (docs-of sessions "sessions")))
-          (is (not-any? #(= session-id (:session-id (:doc %)))
-                        (docs-of sessions "sessions")))
-          (is (empty? (get-in sessions [:partitions "sessions" :docs 0 :doc :ids]))))
+          (let [docs (docs-of sessions "sessions")
+                index (some #(when (= :session-index (:kind %)) (:doc %)) docs)
+                count-doc (some #(when (= :session-count (:kind %)) (:doc %))
+                                docs)]
+            (is (not-any? #(= session-id (:id %)) docs))
+            (is (not-any? #(= session-id (:session-id (:doc %))) docs))
+            (is (empty? (:ids index)))
+            (is (= 0 (:count count-doc))
+                "the committed count moves with the index in the same commit")))
         (testing "no open obligation remains"
           (is (empty? (:obligations all-open))))
         (testing "external effects are disclosed, not revoked"

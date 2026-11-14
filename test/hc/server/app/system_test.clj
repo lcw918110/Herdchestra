@@ -769,7 +769,8 @@
 
 (deftest health-counts-sessions-without-listing-them
   (let [started (system/start! (test-config))
-        list-calls (atom 0)]
+        list-calls (atom 0)
+        id-list-calls (atom 0)]
     (try
       ;; The publisher also lists sessions on its own thread; stop it first so
       ;; the counter measures the health path only.
@@ -777,11 +778,15 @@
       (with-redefs [registry/list-sessions
                     (fn [& _]
                       (swap! list-calls inc)
-                      {:status :ok :sessions []})]
+                      {:status :ok :sessions []})
+                    session-ports/list-session-ids
+                    (fn [& _]
+                      (swap! id-list-calls inc)
+                      {:status :ok :ids []})]
         (let [health (system/health started)]
           (is (true? (:ok health)))
           (is (= 1 (get-in health [:sessions :count]))
-              "the count comes from the committed session-id index")
+              "the count comes from the committed count document")
           (is (zero? @list-calls)
               "health never deserializes every session record"))
         (let [response (http-get (str (:url started) "healthz"))
@@ -789,9 +794,11 @@
           (is (= 200 (.statusCode response)))
           (is (true? (:ok body)))
           (is (= 1 (get-in body [:sessions :count]))
-              "/healthz counts the index, not the records"))
+              "/healthz reads the committed count, not the id list"))
         (is (zero? @list-calls)
-            "the HTTP route never deserializes every session record"))
+            "the HTTP route never deserializes every session record")
+        (is (zero? @id-list-calls)
+            "neither health path materializes the session-id list"))
       (finally
         (system/stop! started)))))
 
@@ -815,6 +822,116 @@
                                  :gateway nil
                                  :persistence persistence})]
       (is (= :unknown (get-in health [:sessions :count]))))))
+
+(defn- counted-session
+  "One minimal committed session for count assertions."
+  [session-id]
+  {:session-id session-id
+   :owner-id (str session-id "-owner")
+   :revision 0
+   :status :active
+   :language :en
+   :title session-id
+   :created-at 1
+   :updated-at 1
+   :messages {}
+   :message-order []
+   :drafts {}})
+
+(deftest committed-session-count-is-point-read-and-follows-commits
+  (storage-support/with-temp-store [store {}]
+    (let [persistence (session-persistence/persistence store)]
+      (testing "an empty store counts zero"
+        (is (= {:status :ok :count 0}
+               (session-ports/committed-session-count persistence))))
+      (is (= :committed
+             (:status (session-ports/commit-session!
+                       persistence 0 (counted-session "count-s1")))))
+      (is (= :committed
+             (:status (session-ports/commit-session!
+                       persistence 0 (counted-session "count-s2")))))
+      (testing "every commit moves the committed count"
+        (is (= 2 (:count (session-ports/committed-session-count persistence)))))
+      (testing "the count agrees with the committed index"
+        (is (= (count (:ids (session-ports/list-session-ids persistence)))
+               (:count (session-ports/committed-session-count persistence)))))
+      (testing "a count read never materializes the id list"
+        (with-redefs [session-ports/list-session-ids
+                      (fn [& _]
+                        (throw (ex-info "the count must not list ids" {})))]
+          (is (= {:status :ok :count 2}
+                 (session-ports/committed-session-count persistence)))))
+      (is (= :deleted
+             (:status (session-ports/delete-session!
+                       persistence 0 "count-s1"))))
+      (testing "a delete moves the committed count in the same commit"
+        (is (= 1 (:count (session-ports/committed-session-count persistence)))))
+      (testing "the count document carries the committed value"
+        (is (= 1 (:count (storage/read-document
+                          store
+                          {:partition "sessions"
+                           :session-id nil
+                           :kind :session-count
+                           :id "sessions"}))))))))
+
+(deftest committed-session-count-falls-back-to-a-legacy-index
+  (storage-support/with-temp-store [store {}]
+    (storage/commit-migration!
+     store
+     {:migration-id "legacy-index-without-count"
+      :partition "sessions"
+      :put [{:kind :session-record
+             :id "legacy-a"
+             :doc (counted-session "legacy-a")}
+            {:kind :session-index
+             :id "sessions"
+             :doc {:id "sessions" :ids ["legacy-a" "legacy-b"]}}]})
+    (let [persistence (session-persistence/persistence store)]
+      (testing "a store written before the count existed reports the index length"
+        (is (= {:status :ok :count 2}
+               (session-ports/committed-session-count persistence))))
+      (testing "the next commit writes the count document"
+        (is (= :committed
+               (:status (session-ports/commit-session!
+                         persistence 0 (counted-session "legacy-a")))))
+        (is (= 2 (:count (storage/read-document
+                          store
+                          {:partition "sessions"
+                           :session-id nil
+                           :kind :session-count
+                           :id "sessions"}))))
+        (is (= 2 (:count (session-ports/committed-session-count
+                          persistence))))))))
+
+(deftest healthz-degrades-a-failed-session-count-to-unknown
+  (let [started (system/start! (test-config))
+        read-document storage/read-document]
+    (try
+      ;; The publisher reads on its own thread; stop it so the injected
+      ;; failure cannot disturb anything but the health path.
+      (is (true? (:stopped? ((:stop! (:publisher started))))))
+      (with-redefs [storage/read-document
+                    (fn [store opts]
+                      (if (= :session-count (:kind opts))
+                        (throw (ex-info "count unavailable"
+                                        {:code
+                                         :TEST_SESSION_COUNT_UNAVAILABLE}))
+                        (read-document store opts)))]
+        (let [health (system/health started)]
+          (is (true? (:ok health))
+              "a failed count is an observation, not a readiness failure")
+          (is (= {:count :unknown} (:sessions health))
+              "the count degrades instead of guessing"))
+        (let [response (http-get (str (:url started) "healthz"))
+              body (edn/read-string (.body response))]
+          (is (= 200 (.statusCode response))
+              "/healthz never turns a failed count into 500 or 503")
+          (is (true? (:ok body)))
+          (is (= :unknown (get-in body [:sessions :count])))
+          (is (contains? body :gateway)
+              "the rest of the health body is intact")))
+      (finally
+        (system/stop! started)))))
 
 (deftest owner-state-preflight-distinguishes-empty-and-corrupt
   (let [dir (temp-dir "hc-owner-preflight-")

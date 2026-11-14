@@ -41,6 +41,7 @@
 (def ^:private session-kind :session-record)
 (def ^:private summary-kind :session-summary)
 (def ^:private index-kind :session-index)
+(def ^:private count-kind :session-count)
 (def ^:private ref-index-kind :session-ref-index)
 (def ^:private session-command-kind :session-command)
 (def ^:private config-kind :app-config)
@@ -110,6 +111,15 @@
   [storage session-id]
   (read-doc storage nil summary-kind session-id))
 
+(defn- read-count-doc
+  "Point-read the committed session count document.
+
+  The count is derived state, so it is written in the same migration that
+  writes the `:session-index`.  A caller can therefore trust the value to
+  agree with the index entries; it never needs to count them."
+  [storage]
+  (read-doc storage nil count-kind index-id))
+
 (defn- read-ref-index-doc
   [storage]
   (read-doc storage nil ref-index-kind index-id))
@@ -126,6 +136,17 @@
 (defn- put-index
   [ids]
   {:kind index-kind :id index-id :doc {:id index-id :ids (vec (distinct ids))}})
+
+(defn- put-count
+  "Build the committed count document for IDS.
+
+  Put it in the same `commit-migration!` as `put-index`: both documents then
+  commit or fail together, so a reader never sees a count that disagrees with
+  the index entries."
+  [ids]
+  {:kind count-kind
+   :id index-id
+   :doc {:id index-id :count (count (distinct ids))}})
 
 (defn- message-listed?
   "True when the message exists and is not deleted or folded.
@@ -404,19 +425,23 @@
                        ref-change (when refs?
                                     (ref-change before-refs after-refs
                                                 index-state))
-                       puts (cond-> [{:kind session-kind
-                                      :id session-id
-                                      :doc session}
-                                     {:kind summary-kind
-                                      :id session-id
-                                      :doc (summary-doc session)}
-                                     (put-index (conj (:ids index-state)
-                                                      session-id))]
-                              identity
-                              (conj (command-index-entry session))
+                      next-ids (conj (:ids index-state) session-id)
+                      ;; The count document rides in the same commit as the
+                      ;; index.  `/healthz` reads it and must never observe a
+                      ;; count that disagrees with the committed entries.
+                      puts (cond-> [{:kind session-kind
+                                     :id session-id
+                                     :doc session}
+                                    {:kind summary-kind
+                                     :id session-id
+                                     :doc (summary-doc session)}
+                                    (put-index next-ids)
+                                    (put-count next-ids)]
+                             identity
+                             (conj (command-index-entry session))
 
-                              ref-change
-                              (conj (:index-doc ref-change)))
+                             ref-change
+                             (conj (:index-doc ref-change)))
                        result
                        (storage/commit-migration!
                         storage
@@ -444,6 +469,21 @@
          (try
            {:status :ok :ids (:ids (session-index-state storage false))}
            (catch clojure.lang.ExceptionInfo t
+             (error-status t))))
+
+       ports/SessionCountRead
+       (count-committed-sessions [_]
+         (try
+           ;; Constant time: one point read of the count document that every
+           ;; commit writes with the index.  A store written before the count
+           ;; existed (or restored from a package that dropped it) has the
+           ;; index but no count, so the fallback counts the index ids: still
+           ;; one point read, and the same value the index holds.
+           (if-let [count-doc (read-count-doc storage)]
+             {:status :ok :count (long (or (:count count-doc) 0))}
+             {:status :ok
+              :count (count (:ids (session-index-state storage false)))})
+           (catch Throwable t
              (error-status t))))
 
        (delete-session! [_ expected-revision session-id]
@@ -493,7 +533,10 @@
                                  :expected-version partition-version
                                  :reason :session-delete
                                  :lightweight-return? true
-                                 :put (cond-> [(put-index ids)]
+                                 :put (cond-> [(put-index ids)
+                                               ;; Decrement in the same
+                                               ;; transaction as the index.
+                                               (put-count ids)]
                                         ref-change
                                         (conj (:index-doc ref-change)))
                                  :delete (into [{:kind session-kind

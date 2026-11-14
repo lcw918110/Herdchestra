@@ -144,6 +144,18 @@
     `:visible-message-count` and `:has-draft?`; it never carries `:messages`
     or `:message-order`."))
 
+(defprotocol SessionCountRead
+  (count-committed-sessions
+    [persistence]
+    "Return `{:status :ok :count n}` or `{:status :unknown :error e}` for
+    the number of sessions in the committed session index.
+
+    An adapter that maintains a counter MUST commit it in the same storage
+    transaction that updates the session index, so a reader never observes a
+    count that disagrees with the index entries.  The health endpoint reads
+    this instead of `list-session-ids`, because listing materializes every
+    id and costs time linear in the session count."))
+
 (defprotocol SessionHistoryIndex
   (session-committed!
     [index session]
@@ -243,6 +255,30 @@
       (if (= :found (:status result))
         (assoc result :session (session-summary-view (:session result)))
         result))))
+
+(defn committed-session-count
+  "Number of sessions in the committed index.
+
+  An adapter that implements `SessionCountRead` reads its maintained counter,
+  which is constant time.  Every other adapter falls back to listing the ids,
+  which is linear in the session count.  A failed read is reported as
+  `{:status :unknown :error e}` and is never guessed as zero."
+  [persistence]
+  (try
+    (if (satisfies? SessionCountRead persistence)
+      (count-committed-sessions persistence)
+      (let [listed (list-session-ids persistence)]
+        (if (= :ok (:status listed))
+          {:status :ok :count (count (:ids listed))}
+          {:status :unknown
+           :error (or (:error listed)
+                      {:code :SESSION_COUNT_UNAVAILABLE
+                       :message "the session index could not be listed"
+                       :details {:status (:status listed)}})})))
+    (catch Throwable t
+      {:status :unknown
+       :error {:code :SESSION_COUNT_UNAVAILABLE
+               :message (or (ex-message t) "the session count could not be read")}})))
 
 (defn- commit-error
   [message data]
@@ -399,6 +435,15 @@
                   config
                   (assoc config :revision (if stored (inc actual) 0)))]
       (cas-value! state [:config] expected-revision value)))
+
+  SessionCountRead
+  (count-committed-sessions [_]
+    (let [sessions (:sessions @state)]
+      (if (map? sessions)
+        {:status :ok :count (count sessions)}
+        {:status :unknown
+         :error {:code :SESSION_COUNT_UNAVAILABLE
+                 :message "the in-memory session map is malformed"}})))
 
   SessionCommandLookup
   (find-session-by-command [_ identity]

@@ -37,10 +37,10 @@
                    {:git-hash git-hash :git-dirty? (boolean git-dirty?)}
                    (version/build-identity))
         component-errors (or component-errors {})
-        ;; A session count is an observation, not a readiness condition.  A
-        ;; 1000-session store can take seconds to count, and a failed or slow
-        ;; count must not turn `/healthz` into 503 while the process can
-        ;; still accept work.
+        ;; A session count is an observation, not a readiness condition.  It
+        ;; is one point read of the committed count document, and a failed or
+        ;; missing count must not turn `/healthz` into 503 while the process
+        ;; can still accept work.
         ok? (and store-open?
                  (some? gateway-stats)
                  (empty? component-errors))]

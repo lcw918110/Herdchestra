@@ -157,8 +157,9 @@
   writer instead of silently losing it."
   (into
    #{;; session persistence documents
-     :session-record :session-summary :session-index :session-command
-     :session-ref-index
+     :session-record :session-summary :session-index :session-count
+     :session-command :session-ref-index
+
      ;; derived full-text index documents; read point-wise today, registered
      ;; here so a future view reader cannot silently lose them
      :search-index :search-posting :search-session

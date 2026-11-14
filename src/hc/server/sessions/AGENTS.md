@@ -511,6 +511,23 @@ Owner starts; it is the durable business point for a reuse command.  A
 second identity owner is refused, and deleting the session removes every
 claim that points to it.
 
+`hc.server.sessions.ports/SessionCountRead` is the optional constant-time
+count capability:
+
+```clojure
+(count-committed-sessions persistence)
+```
+
+It returns `{:status :ok :count n}` or `{:status :unknown :error e}`.  The
+storage adapter point-reads the `:session-count` document and commits it in
+the same `commit-migration!` as `:session-index`, so the count and the id
+entries never disagree.  A store written before the document existed (or a
+restore that dropped it) has the index but no count; the adapter then counts
+the index ids, still one point read.  `ports/committed-session-count` is the
+entry point: it uses this capability when present and otherwise counts
+`list-session-ids`, which is linear in the session count.  Health reads it
+instead of listing ids; a failed read is `:unknown`, never zero.
+
 Revision contract:
 
 - a new value has `:revision 0` and is not stored yet;

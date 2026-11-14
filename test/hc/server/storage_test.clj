@@ -981,8 +981,14 @@
         (is (= ["r2"] (mapv :id (get-in diagnostics [:partitions "diagnostics" :docs]))))
         (is (= ["mem-keep"]
                (mapv :id (get-in materials [:partitions "materials" :docs]))))
-        (is (= ["keep"]
-               (get-in sessions [:partitions "sessions" :docs 1 :doc :ids])))
-        (is (some #(= session-id (:id %))
-                  (get-in sessions [:partitions "sessions" :docs])))
+        (let [sessions-docs (get-in sessions [:partitions "sessions" :docs])]
+          (is (= ["keep"]
+                 (:ids (:doc (first (filter #(= :session-index (:kind %))
+                                            sessions-docs)))))
+              "the index keeps only the other session")
+          (is (= 1 (:count (:doc (first (filter #(= :session-count (:kind %))
+                                                sessions-docs)))))
+              "the committed count moves with the index in the same commit")
+          (is (some #(= session-id (:id %)) sessions-docs)
+              "the erased session record itself is not rewritten here"))
         (is (some #(= :external-services (:scope %)) (:external-effects result)))))))

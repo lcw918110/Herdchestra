@@ -846,13 +846,18 @@
         :exclude-partition? exclude-partition?}))))
 
 (def ^:private rebuilt-session-document-kinds
-  "Documents derived from one session record.
+  "Documents derived from the session index or record.
 
   A backup can replace a session record while keeping a same-named derived
   document from the target store; the derived copy would then describe the
   previous session.  They are recomputed from the restored record, so a
-  restore never carries them."
-  #{:session-summary :session-ref-index})
+  restore never carries them.
+
+  `:session-count` belongs here for the same reason: a category restore can
+  replace the session index without touching the count, and a carried-over
+  count would then disagree with the restored entries.  The session adapter
+  derives the count from the index when the document is absent."
+  #{:session-summary :session-ref-index :session-count})
 
 (defn- drop-rebuilt-session-documents
   [export]
@@ -868,6 +873,23 @@
                                                       (:kind %)))
                                             docs)))]))
                   partitions))))
+
+(defn- restore-session-count-doc
+  "Return the count document implied by a restored session index, if any.
+
+  `:session-count` is dropped with the other rebuilt documents.  The restore
+  writes it again from the restored index in the same transaction, so the
+  invariant holds after a restore: when the count document exists it equals
+  the index entries.  A package without an index carries no count, and the
+  adapter falls back to the index length."
+  [validated]
+  (let [index (some (fn [{:keys [kind doc]}]
+                      (when (= :session-index kind) doc))
+                    (get-in validated [:partitions "sessions" :docs]))]
+    (when (and index (map? (:ids index)))
+      {:kind :session-count
+       :id "sessions"
+       :doc {:id "sessions" :count (count (distinct (:ids index)))}})))
 
 (defn restore-state!
   "Replace the entire current state with a validated export package.
@@ -902,8 +924,12 @@
                                (filter export/derived-partition?)
                                sort
                                vec))
-        validated (-> (export/validate export)
-                      drop-rebuilt-session-documents)]
+        validated (let [validated (-> (export/validate export)
+                                      drop-rebuilt-session-documents)]
+                    (if-let [count-doc (restore-session-count-doc validated)]
+                      (update-in validated [:partitions "sessions" :docs]
+                                 conj count-doc)
+                      validated))]
     (with-commit-lock store
       (when-not (:accepting? @(:state store))
         (err/raise :STORAGE_CLOSING "the store is closing; restore is refused"
@@ -1026,6 +1052,9 @@
         ids (vec (or (:ids index) []))
         next-ids (vec (remove #{session-id} ids))]
     (when (and index (not= ids next-ids))
+      ;; The committed count must move in the same transaction as the index,
+      ;; or a reader between two commits would see a stale count.  `:healthz`
+      ;; reads this document instead of counting the ids.
       (commit-migration!
        store
        {:migration-id (str "session-index-erase-" (UUID/randomUUID))
@@ -1034,7 +1063,10 @@
         :lightweight-return? true
         :put [{:kind :session-index
                :id (or (:id index) "sessions")
-               :doc (assoc (strip-storage-identity index) :ids next-ids)}]}))
+               :doc (assoc (strip-storage-identity index) :ids next-ids)}
+              {:kind :session-count
+               :id "sessions"
+               :doc {:id "sessions" :count (count next-ids)}}]}))
     {:updated? (and (some? index) (not= ids next-ids))
      :removed (count (remove #{session-id} ids))}))
 
