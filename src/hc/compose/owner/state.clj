@@ -1011,6 +1011,74 @@
         (put-assistant state run text true now {})))
     state))
 
+(def default-run-text-window
+  "How many of the newest terminal runs keep their text body inline.
+
+  The run text duplicates the assistant message already mirrored into the
+  conversation.  A session that never bounds that duplicate pays for every
+  answer twice on every full-state commit.  The newest window stays inline
+  because the operator view and the streaming/cancel paths read a recent
+  run's text directly; older runs keep `:text-length` only."
+  64)
+
+(defn- run-text-mirrored?
+  "True when RUN's text also lives in the conversation.
+
+  `put-assistant` writes the run text into the conversation for every
+  non-actor run and keeps it there; an actor run keeps its text in the
+  agent's private context instead, so the run record is its only copy."
+  [state run]
+  (and (not (actor-call? state (:call-id run)))
+       (some #(= (:message-id run) (:message-id %))
+             (:conversation state))))
+
+(defn- collapsible-run?
+  [state run]
+  (and (run-terminal? run)
+       (seq (str (or (:text run) "")))
+       (run-text-mirrored? state run)))
+
+(defn collapse-run-text
+  "Drop the text of terminal runs older than the retention window.
+
+  The newest `:run-text-window` terminal runs keep their body inline: the
+  operator view and the streaming and cancellation paths read a recent
+  run's text directly, and a test contract states that a just-finished
+  answer stays readable on its run record.  Older terminal runs keep only
+  `:text-length`, because their body is already the assistant message in
+  the conversation and nothing reads the duplicate.
+
+  A live run always keeps its text: `append-run-text` accumulates into it.
+  An actor run always keeps its text too, because `put-assistant`
+  deliberately skips the conversation for actor calls, so the run record
+  is that text's only copy.  The function is idempotent."
+  ([state] (collapse-run-text state nil))
+  ([state window]
+   (let [window (or window
+                    (get-in state [:config :run-text-window])
+                    default-run-text-window)
+         candidates (->> (:runs state)
+                         (keep (fn [[id run]]
+                                 (when (collapsible-run? state run)
+                                   [id run])))
+                         ;; Newest first.  `finished-at` is a monotonic
+                         ;; stamp per Owner turn; the run id breaks ties so
+                         ;; the window is deterministic.
+                         (sort-by (fn [[id run]]
+                                    [(- (long (or (:finished-at run) 0))) id])
+                                  (fn [[fa ia] [fb ib]]
+                                    (if (= fa fb)
+                                      (compare ia ib)
+                                      (< fa fb)))))
+         doomed (drop window candidates)]
+     (reduce (fn [state [id run]]
+               (assoc-in state [:runs id]
+                         (-> run
+                             (assoc :text-length (count (str (:text run))))
+                             (dissoc :text))))
+             state
+             doomed))))
+
 (defn finish-run
   "Fix one run terminal and finalize its assistant message.
 
@@ -1027,36 +1095,38 @@
        (run-terminal? run)
        (record-late-run-event state id {:event :terminal :status status} now)
 
-       :else
-       ;; A terminal that carries no text keeps the text already streamed.
-       ;; Taking a blank payload literally would erase what the operator
-       ;; saw and what the outbound copy already carried.
-       (let [text (if (str/blank? (str text))
-                    (str (or (:text run) ""))
-                    text)
-             run (assoc run
-                        :status status
-                        :finished-at now
-                        :text text
-                        :cancel-reason cancel-reason
-                        :error error
-                        :search-status (:search-status extra)
-                        :search-degraded? (:search-degraded? extra)
-                        :search-failed? (:search-failed? extra))
-             state (assoc-in state [:runs id] run)]
-         (put-assistant state run text false now
-                        (merge (cond-> {:status status}
-                                 cancel-reason
-                                 (assoc :cancel-reason cancel-reason)
-                                 (= status :cancelled)
-                                 (assoc :cancelled? true)
-                                 (= status :failed)
-                                 (assoc :failed? true)
-                                 (= status :finished)
-                                 (assoc :finished? true))
-                               (dissoc extra :text :error
-                                       :cancel-reason)))))
-     state)))
+      :else
+      ;; A terminal that carries no text keeps the text already streamed.
+      ;; Taking a blank payload literally would erase what the operator
+      ;; saw and what the outbound copy already carried.
+      (let [text (if (str/blank? (str text))
+                   (str (or (:text run) ""))
+                   text)
+            run (assoc run
+                       :status status
+                       :finished-at now
+                       :text text
+                       :cancel-reason cancel-reason
+                       :error error
+                       :search-status (:search-status extra)
+                       :search-degraded? (:search-degraded? extra)
+                       :search-failed? (:search-failed? extra))
+            state (assoc-in state [:runs id] run)
+            state (put-assistant state run text false now
+                                 (merge (cond-> {:status status}
+                                          cancel-reason
+                                          (assoc :cancel-reason cancel-reason)
+                                          (= status :cancelled)
+                                          (assoc :cancelled? true)
+                                          (= status :failed)
+                                          (assoc :failed? true)
+                                          (= status :finished)
+                                          (assoc :finished? true))
+                                        (dissoc extra :text :error
+                                                :cancel-reason)))]
+        (collapse-run-text state)))
+    state)))
+
 
 (defn finish-run-for-attempt
   [state call-id attempt-id outcome payload error now]
