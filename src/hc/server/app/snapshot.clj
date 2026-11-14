@@ -225,6 +225,44 @@
      {:message/by-id (by-id messages :id)
       :message/order (mapv :id messages)})))
 
+(defn- narrow-conversation
+  "Narrow one projected conversation to its publication window.
+
+  The projection always runs on the complete `:conversation`, so every message
+  id keeps the value it has without a window.  An entry without an explicit id
+  keeps its position-derived fallback from the full vector; the slice never
+  renumbers it.  Narrowing here therefore selects entities; it cannot change
+  their identity.
+
+  SIZE follows `history-window-size`: nil or negative publishes every entry,
+  zero publishes none, and a positive size publishes the newest ones.
+  PUBLISHED names ids the client already fetched; such an entity must stay
+  published wherever it sits.  A nil PUBLISHED is the fresh-client case and
+  selects only the tail.  `:message/by-id` and `:message/order` are filtered
+  together, so the client invariant holds: the order lists each published id
+  exactly once and no ordered id lacks an entity.
+
+  Apply this AFTER the session cache, never inside it.  The cache entry is
+  keyed by the owner version alone, so a windowed projection cached under that
+  key would freeze the first tick's window; narrowing per tick keeps the cache
+  key correct and lets a fetch widen the published window without an owner
+  commit."
+  [{:message/keys [by-id order]} size published]
+  (let [start (if (and (integer? size) (not (neg? size)))
+                (- (count order) (min (count order) size))
+                0)
+        published (set published)
+        kept (into []
+                   (comp (keep-indexed
+                          (fn [index id]
+                            (when (or (>= index start)
+                                      (contains? published id))
+                              id)))
+                         (distinct))
+                   order)]
+    {:message/by-id (select-keys by-id kept)
+     :message/order kept}))
+
 ;; ---------------------------------------------------------------------------
 ;; Session projection
 
@@ -843,26 +881,38 @@
         settings-present? (contains? config :models)
         settings-connections (when settings-present? (:settings/by-id settings))
         settings-models (when settings-present? (:settings/models settings))
-        conversations (into {}
-                            (keep (fn [[session-id owner]]
-                                    (when-let [state (:state owner)]
-                                      [session-id
-                                       (if session-cache
-                                         (cached-entry
-                                          session-cache :conversation session-id
-                                          (:version owner)
-                                          #(conversation-view
-                                            (remove (fn [message]
-                                                      (or (:nudge? message)
-                                                          (:nudge-id message)))
-                                                    (:conversation state))
-                                            session-id))
-                                         (conversation-view
-                                          (remove #(or (:nudge? %)
-                                                       (:nudge-id %))
-                                                  (:conversation state))
-                                          session-id))])))
-                            visible-owners)
+        conversations
+        (into {}
+              (keep (fn [[session-id owner]]
+                      (when-let [state (:state owner)]
+                        ;; This projection publishes the same entities as the
+                        ;; history projection, so it needs the same window.
+                        ;; Without it a long session ships its whole transcript
+                        ;; on every tick, and a session nobody opened ships
+                        ;; entities the history projection withholds.  The
+                        ;; window is applied after the projection, which reads
+                        ;; the complete conversation, so a narrowed message
+                        ;; keeps the id it has in the unwindowed projection.
+                        (let [window-size (if (= session-id active-session)
+                                            history-window-size
+                                            inactive-window)
+                              published (when published-windows
+                                          (get @published-windows session-id))
+                              project #(conversation-view
+                                        (remove (fn [message]
+                                                  (or (:nudge? message)
+                                                      (:nudge-id message)))
+                                                (:conversation state))
+                                        session-id)
+                              projected (if session-cache
+                                          (cached-entry
+                                           session-cache :conversation
+                                           session-id (:version owner) project)
+                                          (project))]
+                          [session-id (narrow-conversation projected
+                                                           window-size
+                                                           published)]))))
+              visible-owners)
         messages {:message/by-id
                   (into {}
                         (mapcat (comp :message/by-id val)
