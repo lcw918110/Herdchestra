@@ -2121,6 +2121,138 @@
     (update-in state [:runs id :tool-call-ids] (fnil conj []) tool-call-id)
     state))
 
+;; ---------------------------------------------------------------------------
+;; Streaming text
+
+(defn- commit-visible-fragment
+  "Write one fragment into committed state: run text, message, history, call.
+
+  This is the only path from a fragment into committed state, so the run
+  text, the assistant message, the mirrored history entry, and the call
+  output always advance together."
+  [state current id text model-call-id attempt-id now ctx]
+  (let [state (-> state
+                  (state/ensure-run model-call-id attempt-id now)
+                  (state/append-run-text id text now))
+        run (get-in state [:runs id])
+        state (if (and run
+                       (not (:session-run current))
+                       (not (:actor-attempt-id current)))
+                (mirror-history-message!
+                 state
+                 {:message-id (:message-id run)
+                  :role :assistant
+                  :content (str (:text run))
+                  :nudge? (:nudge? run)
+                  :nudge-id (:nudge-id run)
+                  :run-id (:run-id run)}
+                 ctx)
+                state)]
+    (update-in state [:calls model-call-id :output] str text)))
+
+(defn- chunk-fragment
+  "The streaming fragment MESSAGE carries, or nil when it carries none."
+  [message]
+  (let [event (:event message)]
+    (when (and (= :model/event (:type message))
+               (= :chunk (:event event)))
+      (let [call-id (or (:model-call-id event) (:call-id event))
+            attempt-id (:attempt-id event)]
+        (when (and call-id attempt-id)
+          {:call-id call-id
+           :attempt-id attempt-id
+           :text (str (or (:text event) ""))})))))
+
+(defn- buffer-chunk!
+  "Merge one streaming fragment into the Owner-side buffer.
+
+  Committed state is untouched here, so a fragment the client will not see
+  yet costs no commit at all.  The buffer is keyed by run id and only the
+  mailbox thread touches it.
+
+  The run's first fragment is committed immediately by the caller: the
+  operator must see the answer start without waiting for a bound."
+  [state message fragment ctx]
+  (when-let [buffer (:stream-buffer ctx)]
+    (let [id (state/run-id (:call-id fragment) (:attempt-id fragment))
+          run (get-in state [:runs id])]
+      (when (and run (not (state/run-terminal? run)))
+        (swap! buffer
+               (fn [entries]
+                 (let [entry (or (get entries id)
+                                 (state/new-stream-entry run))]
+                   (assoc entries id
+                          (state/buffer-stream-text
+                           entry (:text fragment) (:now ctx)
+                           (get message state/mailbox-message-id))))))))))
+
+(defn- fold-due-tail!
+  "Fold the buffered tail of FRAGMENT's run when a bound is reached.
+
+
+  Returns the state unchanged when the tail is still under both bounds, so
+  the caller's candidate equals the committed state and the mailbox skips
+  the commit."
+  [state fragment ctx]
+  (if-let [buffer (:stream-buffer ctx)]
+    (let [id (state/run-id (:call-id fragment) (:attempt-id fragment))
+          entry (get @buffer id)
+          run (get-in state [:runs id])]
+      (if (and run entry (state/flush-due? entry (:now ctx)))
+        (first (state/fold-stream-text state id entry (:now ctx)))
+        state))
+    state))
+
+(defn- fold-buffered-tails
+  "Fold every buffered tail into STATE, ignoring the size and age bounds.
+
+  A terminal, a cancel, a tool call, and a dispatch failure all finalize,
+  order, or mirror the answer, so none of them may observe a partial tail.
+  Folding inside the same transition is what makes cancellation lose no
+  visible text: the operator's stop command is a message, so its buffered
+  tail joins the run before any guard finalizes the answer.  Nothing here
+  consults a sender, so no flush race exists.
+
+  The fold never removes text.  A commit that fails leaves the tail in the
+  buffer, and the retried message folds the same tail again."
+  [state ctx]
+  (if-let [buffer (:stream-buffer ctx)]
+    (reduce-kv
+     (fn [state id entry]
+       (if-let [[state' entry'] (state/fold-stream-text state id entry
+                                                       (:now ctx))]
+         (do (swap! buffer assoc id entry') state')
+         state))
+     state
+     @buffer)
+    state))
+
+(defn- retire-covered-tails!
+  "Retire buffered text that committed STATE already covers.
+
+  STATE is the committed state a message is applied to, never a candidate,
+  so this can only drop text that is already durable.  An entry whose run is
+  terminal is late evidence and is retired too: its text can never be
+  covered, and it is already recorded in the run's `:late-events`."
+  [state ctx]
+  (when-let [buffer (:stream-buffer ctx)]
+    (when (seq @buffer)
+      (swap! buffer
+             (fn [entries]
+               (reduce-kv
+                (fn [acc id entry]
+                  (let [run (get-in state [:runs id])
+                        entry' (if (and run (not (state/run-terminal? run)))
+                                 (state/prune-stream-entry run entry)
+                                 (assoc entry :text ""))]
+                    (cond
+                      (:late? entry) acc
+                      (str/blank? (state/pending-stream-text entry')) acc
+                      :else (assoc acc id entry'))))
+                {}
+                entries)))))
+  state)
+
 (defn- record-actor-terminal
   "Feed one model terminal back into the actor slot lifecycle.
 
@@ -2317,27 +2449,28 @@
         :chunk
         (let [text (or (:text event) "")
               state (state/ensure-run state model-call-id attempt-id now)
-              state (state/append-run-text state id text now)
               run (get-in state [:runs id])
-              call (get-in state [:calls model-call-id])
-              state (if (and run
-                             (not (:session-run call))
-                             (not (:actor-attempt-id call)))
-                      (mirror-history-message!
-                       state
-                       {:message-id (:message-id run)
-                        :role :assistant
-                        :content (str (:text run))
-                        :nudge? (:nudge? run)
-                        :nudge-id (:nudge-id run)
-                        :run-id (:run-id run)}
-                       ctx)
-                      state)]
-          {:state (update-in state [:calls model-call-id :output] str text)
+              fragment {:call-id model-call-id
+                        :attempt-id attempt-id
+                        :text text}
+              ;; The run's opening fragment is committed at once so the
+              ;; operator sees the answer start; later fragments wait in the
+              ;; Owner-side buffer and are folded only when a size or age
+              ;; bound is reached.  A still-buffered fragment leaves the
+              ;; candidate equal to committed state, so the mailbox commits
+              ;; nothing for it.
+              state (if (and (:stream-buffer ctx) run
+                             (not (state/run-terminal? run))
+                             (pos? (state/committed-run-text-length run)))
+                      (do (buffer-chunk! state message fragment ctx)
+                          (fold-due-tail! state fragment ctx))
+                      (commit-visible-fragment state current id text
+                                               model-call-id attempt-id now
+                                               ctx))]
+          {:state state
            :receipt {:status :accepted :outcome :chunk
                      :run-id id
                      :message-id (get-in state [:runs id :message-id])}})
-
         :tool-call
         (let [raw-payload (or (:payload event) {})
               ;; Some transports carry a short assistant preamble with the
@@ -3281,7 +3414,17 @@
   business state is unchanged: a duplicate report delivery still has to
   return its acknowledgement, and that effect must survive the commit."
   [state message ctx]
-  (let [result (apply-message* state message ctx)
+  (let [;; Retire only text the committed STATE already covers, so a retried
+        ;; message never observes a buffer whose text was dropped but never
+        ;; committed.
+        _ (retire-covered-tails! state ctx)
+        ;; A terminal, a cancel, a tool call, or a failure must see the whole
+        ;; answer, so buffered tails join the state before the transition.
+        ;; A chunk message owns its own run and already applied its bounds.
+        state (if (chunk-fragment message)
+                state
+                (fold-buffered-tails state ctx))
+        result (apply-message* state message ctx)
         outbox (vec (:outbox result))
         final (if (and (= state (:state result)) (empty? outbox))
                 result

@@ -1011,6 +1011,139 @@
         (put-assistant state run text true now {})))
     state))
 
+(def default-stream-flush-chars
+  "Unflushed streaming text that forces a commit.
+
+  One Owner commit is a whole-document compare-and-set, so committing every
+  provider chunk pays for the whole document on every fragment.  Streaming
+  text therefore waits in an uncommitted Owner-side buffer and is folded
+  into the run in bounded batches.  The committed assistant message stays
+  the only authority a reader sees, so a buffered tail is text nobody has
+  seen yet: it can be delayed but never needs to be reconstructed."
+  192)
+
+(def default-stream-flush-ms
+  "Age of the oldest unflushed fragment that forces a commit.
+
+  A slow stream of small chunks would otherwise stay invisible until the
+  next terminal; this bound keeps the live answer within one short interval
+  of the wire."
+  240)
+
+(def mailbox-message-id
+  "Mailbox key of the per-message id.
+
+  The id makes a buffer merge replay-safe: a commit conflict re-applies the
+  same message from the same committed state, and the fragment must not be
+  merged twice."
+  :hc.compose.owner.mailbox/message-id)
+
+(defn committed-run-text-length
+  "Characters of RUN text that already live in committed state."
+  [run]
+  (count (str (or (:text run) ""))))
+
+(defn new-stream-entry
+  "Open an uncommitted streaming entry for RUN.
+
+  `:text` holds only characters the committed run text does not cover yet,
+  and `:start` is where that tail begins in the run's stream.  Pruning
+  advances `:start` and drops the covered prefix; it consults committed
+  state only, never a candidate, so it can never lose text whose commit did
+  not land.
+
+  Only the Owner thread owns this value.  It never enters committed state,
+  so it cannot change what a reader or a commit sees."
+  [run]
+  {:text ""
+   :since nil
+   :at 0
+   :fragments 0
+   :last-message nil
+   :start (committed-run-text-length run)})
+
+(defn buffer-stream-text
+  "Merge one fragment into an uncommitted streaming ENTRY.
+
+  A repeated message id is a replay of a fragment already merged, so it is
+  dropped: the mailbox may re-apply one message after a commit conflict."
+  [entry text now message-id]
+  (let [fragment (str (or text ""))]
+    (if (or (str/blank? fragment)
+            (and (some? message-id)
+                 (= message-id (:last-message entry))))
+      entry
+      (-> entry
+          (update :text str fragment)
+          (update :fragments (fnil inc 0))
+          (assoc :at now
+                 :last-message message-id
+                 :since (or (:since entry) now))))))
+
+(defn prune-stream-entry
+  "Drop the prefix of ENTRY that the committed RUN text already covers.
+
+  This is the only acknowledgement a fold gets.  It reads committed state,
+  so it is safe to run before a commit: the characters it drops are already
+  durable, and a retried message recomputes the same pending tail from that
+  durable state."
+  [run entry]
+  (let [text (str (or (:text entry) ""))
+        covered (max 0 (min (- (committed-run-text-length run)
+                               (long (or (:start entry) 0)))
+                            (count text)))]
+    (if (zero? covered)
+      entry
+      (let [rest-text (subs text covered)]
+        (-> entry
+            (assoc :text rest-text)
+            (update :start + covered)
+            (assoc :since (when (seq rest-text) (:since entry))))))))
+
+(defn pending-stream-text
+  "Text of ENTRY not yet committed into its run's text."
+  [entry]
+  (str (or (:text entry) "")))
+
+(defn flush-due?
+  "True when ENTRY's pending tail has grown or waited enough to commit."
+  ([entry now] (flush-due? entry now default-stream-flush-chars
+                          default-stream-flush-ms))
+  ([entry now chars ms]
+   (let [pending (pending-stream-text entry)]
+     (boolean
+      (and (seq pending)
+           (or (>= (count pending) (long chars))
+               (and (:since entry)
+                    (>= (- (long now) (long (:since entry))) (long ms)))))))))
+
+(defn fold-stream-text
+  "Fold ENTRY's pending tail into its run.  Returns `[state entry']` or nil.
+
+  A live run appends the tail, which also rewrites the assistant message
+  through `append-run-text`.  A terminal run keeps the tail as late evidence
+  only: nobody ever saw it, so it must not reopen a finished answer, and the
+  returned entry is marked `:late?` for the caller to retire.
+
+  Nothing is removed here.  The entry keeps its text until
+  `prune-stream-entry` observes that the run's committed text covers it, so
+  a commit that fails simply leaves the text uncommitted and the retry folds
+  the same tail again."
+  [state id entry now]
+  (if-let [run (get-in state [:runs id])]
+    (let [pending (pending-stream-text entry)]
+      (cond
+        (str/blank? pending)
+        [state entry]
+
+        (run-terminal? run)
+        [(record-late-run-event state id {:event :chunk :text pending} now)
+         (assoc entry :late? true)]
+
+        :else
+        [(append-run-text state id pending now) entry]))
+    nil))
+
 (def default-run-text-window
   "How many of the newest terminal runs keep their text body inline.
 
