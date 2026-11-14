@@ -885,11 +885,12 @@
   [validated]
   (let [index (some (fn [{:keys [kind doc]}]
                       (when (= :session-index kind) doc))
-                    (get-in validated [:partitions "sessions" :docs]))]
-    (when (and index (map? (:ids index)))
+                    (get-in validated [:partitions "sessions" :docs]))
+        ids (:ids index)]
+    (when (coll? ids)
       {:kind :session-count
        :id "sessions"
-       :doc {:id "sessions" :count (count (distinct (:ids index)))}})))
+       :doc {:id "sessions" :count (count (distinct ids))}})))
 
 (defn restore-state!
   "Replace the entire current state with a validated export package.
@@ -899,11 +900,12 @@
   replaces all documents, obligations, blob references, partition metadata and
   receipts in one atomic transaction.  A validation failure changes nothing.
 
-  Session-derived documents (`:session-summary`, `:session-ref-index`) are
-  never carried across the restore: a backup can replace a session record
-  while keeping a same-named derived document, and the stale copy would
-  disagree with the restored record.  The session adapter rebuilds them from
-  the restored records.
+  Session-derived documents (`:session-summary`, `:session-ref-index`,
+  `:session-count`) are never carried across the restore: a backup can replace
+  a session record while keeping a same-named derived document, and the stale
+  copy would disagree with the restored record.  The session adapter rebuilds
+  them from the restored records; the count is rewritten here from the
+  restored index so it agrees with the entries inside the same transaction.
 
   A package that still carries a rebuildable derived partition (an older
   whole-store export, `\"search\"` today) restores every current-state

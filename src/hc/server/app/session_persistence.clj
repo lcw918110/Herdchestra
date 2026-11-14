@@ -14,6 +14,9 @@
     - `read-session` and the commit precondition point-read one
       `:session-record`;
     - `list-session-ids` point-reads the `:session-index`;
+    - `count-committed-sessions` point-reads the `:session-count` document,
+      which every index-changing commit writes in the same migration, so a
+      reader never sees a count that disagrees with the index entries;
     - `read-session-summary` point-reads the compact `:session-summary` and
       falls back to one record only when that derived document is absent;
     - the creation-command check point-reads one `:session-command`;
