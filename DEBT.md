@@ -41,7 +41,10 @@
 - **已完成的读者普查**（静态阅读，未运行）：Owner 层所有扫描 `:runs` 的循环都先判 `:status ∈ {:started :streaming}`，因此终态记录在这些路径里只做一次关键字比较——`conversation-stable?`（`state.clj:767`）、`active-run-for-call`（`state.clj:920`）、`finish-runs-for-call`（`state.clj:1159`）。发布侧的 `snapshot.clj:989` 读终态 run 的唯一目的是把 `:streaming?` 纠正为 false，按 `:message-id` 匹配，只需要「哪些 message-id 已终态」这一集合，不需要整条记录。`compact.clj:214` 与 `compact.clj:300` 对 `:runs` 逐条走 `compact-value`/`restore-value` 外置，不施加结构折叠。
 - **影响**：这是修完 `:calls` 与 run `:text` 之后**剩余的最大单项**，比 `:conversation` 本体更大。按线性增长估算，`:runs` 每轮约 513 字符，800 轮即 411 KB；它比 `:conversation` 更早把文档推向 8 000 000 字符的 `:OWNER_STATE_TOO_LARGE` 硬上限。
 - **不建议的做法**：不能删掉整条终态 run 记录。它是 `:message-id` → run 身份的唯一映射，`mirror-history-message!` 与发布侧的 streaming 纠正都依赖它；`recover-state`（`state.clj:1867`、`1892`、`1930`）在重启时按 `:status` 分流，也必须能看到这些记录。不能把 `:context` 无脑折叠——`start-run`（`state.clj:883`）把它写进 run，需先确认终态后有无读者。
-- **建议方向**：把终态 run 折叠为「身份 + 终态 + 时间 + 计数」的最小集，把 `:context` 与 `:tool-call-ids` 之外的明细外置到 blob 区（与 `:calls` 的 `:request :snapshot` 同一机制）。保守估计可去掉 460 字符/条 中的大部分。**必须先跑完整读者普查**：本条目只做了静态阅读，`test/` 下对 `:runs` 的直接断言（`compact_test.clj:40`、`run_text_window_test.clj:41`、`attempt_id_normalization_test.clj:48`、`handlers_test.clj:1285`）会受影响，须逐个判定是锁行为还是锁字段。
+- **两个候选字段的判定**：
+  - `:tool-call-ids` 有 3 处读者。`guards.clj:455` 只问 `(seq (:tool-call-ids run))`——一个**非空性**判断，且它的扫描**没有** `:status` 过滤，所以确实会看终态 run，但只需要「是否非空」这一位。`handlers.clj:2088` 用 ids 的**内容**去反查工具名，但只在构造当前轮 turn 汇总时用。`handlers.clj:2121` 是写入方。因此终态 run 只需保留一个「有工具证据」的布尔，内容可外置。
+  - `:context` 在 `state.clj:894` 由 `start-run` 从 call 复制进 run；全部 20 处 `:context` 命中都在讨论 agent 私有上下文（另一概念）或 call 的 context，没有一处读**run** 的 `:context`。判定：终态后无活读者，可外置。
+- **建议方向**：把终态 run 折叠为「身份 + 终态 + 时间 + 计数 + 是否有工具证据」的最小集，把 `:context` 与 `:tool-call-ids` 明细外置到 blob 区（与 `:calls` 的 `:request :snapshot` 同一机制）。保守估计可去掉 460 字符/条 中的大部分。**必须先跑完整读者普查**：本条目只做了静态阅读，`test/` 下对 `:runs` 的直接断言（`compact_test.clj:40`、`run_text_window_test.clj:41`、`attempt_id_normalization_test.clj:48`、`handlers_test.clj:1285`）会受影响，须逐个判定是锁行为还是锁字段。
 - **触发条件**：任何会话进入 300 轮以上；或单次提交观测到文档超过 400 KB。
 
 ## D-50 发布侧每 tick 全量投影所有会话的 `:conversation`
