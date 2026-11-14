@@ -159,12 +159,15 @@
 .hc-inline-image{max-width:100%;height:auto;border-radius:8px}
 .hc-rule{border:0;border-top:1px solid var(--wb-line,var(--f7-list-item-border-color,#d8d8dc));margin:10px 0}
 .hc-banner{border-color:var(--wb-line,var(--f7-list-item-border-color,#d8d8dc))}
-.hc-banner-error{border-color:var(--wb-danger,#c62828);background:#ffebee;background:color-mix(in srgb,var(--wb-danger,#c62828) 12%,var(--wb-surface,#fff));color:var(--wb-danger,#7f0000)}
-.hc-banner-warning{border-color:var(--wb-warn,#ef6c00);background:#fff3e0;background:color-mix(in srgb,var(--wb-warn,#ef6c00) 14%,var(--wb-surface,#fff));color:var(--wb-warn,#6d3b00)}
-.hc-banner-info{border-color:var(--wb-accent,#1565c0);background:#e3f2fd;background:color-mix(in srgb,var(--wb-accent,#1565c0) 12%,var(--wb-surface,#fff));color:var(--wb-accent,#0d3c6e)}
-.hc-blocked{border-color:var(--wb-danger,#a4000f);border-left-color:var(--wb-danger,#a4000f);background:#fff4f4;background:color-mix(in srgb,var(--wb-danger,#a4000f) 12%,var(--wb-surface,#fff));color:var(--wb-danger,#5a0008)}
-.hc-late-result{border-left-color:var(--wb-warn,#ef6c00);background:#fff3e0;background:color-mix(in srgb,var(--wb-warn,#ef6c00) 14%,var(--wb-surface,#fff));color:var(--wb-warn,#6d3b00)}
-.hc-context-warnings{background:#fff3e0;background:color-mix(in srgb,var(--wb-warn,#ef6c00) 14%,var(--wb-surface,#fff));color:var(--wb-warn,#6d3b00)}
+/* Every status surface is a solid token.  workbench.css owns the values and
+   precomputed the old srgb mix there, so a static contrast test can resolve
+   exactly what the browser paints.  color-mix() would be unverifiable. */
+.hc-banner-error{border-color:var(--wb-danger,#c62828);background:var(--wb-banner-error-bg,#ffebee);color:var(--wb-danger,#7f0000)}
+.hc-banner-warning{border-color:var(--wb-warn,#ef6c00);background:var(--wb-banner-warning-bg,#fff3e0);color:var(--wb-warn,#6d3b00)}
+.hc-banner-info{border-color:var(--wb-accent,#1565c0);background:var(--wb-banner-info-bg,#e3f2fd);color:var(--wb-accent,#0d3c6e)}
+.hc-blocked{border-color:var(--wb-danger,#a4000f);border-left-color:var(--wb-danger,#a4000f);background:var(--wb-banner-error-bg,#fff4f4);color:var(--wb-danger,#5a0008)}
+.hc-late-result{border-left-color:var(--wb-warn,#ef6c00);background:var(--wb-banner-warning-bg,#fff3e0);color:var(--wb-warn,#6d3b00)}
+.hc-context-warnings{background:var(--wb-banner-warning-bg,#fff3e0);color:var(--wb-warn,#6d3b00)}
 @media (max-width:599px){.hc-conversation .hc-button{min-height:44px!important;min-width:44px!important}}")
 
 (defn- style [m]

@@ -11,6 +11,13 @@
   --wb-danger: #a3261f;
   --wb-warn: #8a5300;
   --wb-ok: #1f6b3a;
+  /* Solid banner surfaces.  Each value is the srgb mix the conversation
+     surface used to declare with color-mix(), precomputed so a static
+     contrast test can resolve it: status token at 12% (error/info) or 14%
+     (warning) over --wb-surface. */
+  --wb-banner-error-bg: #f4e5e4;
+  --wb-banner-warning-bg: #efe7db;
+  --wb-banner-info-bg: #e2ecf1;
   --wb-shadow: 0 12px 40px rgba(16, 30, 45, 0.16);
   --wb-radius: 12px;
   --wb-nav-width: 224px;
@@ -30,6 +37,9 @@ html[data-theme="dark"] {
   --wb-warn: #ffc266;
   --wb-ok: #8ee0a8;
   --wb-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  --wb-banner-error-bg: #342f36;
+  --wb-banner-warning-bg: #383732;
+  --wb-banner-info-bg: #223441;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -47,6 +57,9 @@ html[data-theme="dark"] {
     --wb-warn: #ffc266;
     --wb-ok: #8ee0a8;
     --wb-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    --wb-banner-error-bg: #342f36;
+    --wb-banner-warning-bg: #383732;
+    --wb-banner-info-bg: #223441;
   }
 }
 
@@ -66,8 +79,66 @@ html[data-theme="dark"] {
   color-scheme: dark;
 }
 
+/* High contrast is a complete palette of its own, not a light-theme hint.
+   It must stay after the theme blocks: same specificity, later wins, so a
+   dark theme still reads black-on-white once `data-contrast="high"` is set.
+   `contrast_test.clj` reads exactly this block; nothing is injected at
+   runtime, so the tested values are the painted values. */
 html[data-contrast="high"] {
   color-scheme: light;
+  --wb-bg: #ffffff;
+  --wb-surface: #ffffff;
+  --wb-surface-2: #f2f2f2;
+  --wb-ink: #000000;
+  --wb-ink-muted: #1a1a1a;
+  --wb-line: #000000;
+  --wb-accent: #003f66;
+  --wb-accent-ink: #ffffff;
+  --wb-danger: #7a0000;
+  --wb-warn: #4d2e00;
+  --wb-ok: #0b4d24;
+  --wb-banner-error-bg: #efe0e0;
+  --wb-banner-warning-bg: #e6e2db;
+  --wb-banner-info-bg: #e0e8ed;
+  --wb-shadow: none;
+  --f7-label-color: #1a1a1a;
+  --f7-card-bg-color: #ffffff;
+  --f7-list-item-border-color: #000000;
+}
+
+html[data-contrast="high"] .hc-button,
+html[data-contrast="high"] input,
+html[data-contrast="high"] textarea,
+html[data-contrast="high"] select {
+  border-color: #000000 !important;
+}
+
+html[data-contrast="high"] .hc-button:focus-visible,
+html[data-contrast="high"] input:focus-visible,
+html[data-contrast="high"] textarea:focus-visible,
+html[data-contrast="high"] select:focus-visible {
+  outline: 3px solid #000000 !important;
+  outline-offset: 2px;
+}
+
+/* Motion preferences are document attributes, so they belong to the same
+   stylesheet as the palette.  `auto` defers to the operating system. */
+html[data-reduced-motion="true"] *,
+html[data-reduced-motion="true"] *::before,
+html[data-reduced-motion="true"] *::after {
+  scroll-behavior: auto !important;
+  transition: none !important;
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-reduced-motion="auto"] *,
+  html[data-reduced-motion="auto"] *::before,
+  html[data-reduced-motion="auto"] *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
 }
 
 html,

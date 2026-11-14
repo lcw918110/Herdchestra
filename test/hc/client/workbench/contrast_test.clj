@@ -1,20 +1,21 @@
 (ns hc.client.workbench.contrast-test
   "Machine-checked WCAG 2.x contrast for the workbench palette.
 
-  The test parses `resources/public/css/workbench.css`, resolves custom
-  properties for light, dark, and high-contrast themes, and computes the
-  WCAG relative-luminance ratio for six user-visible pairs.  It supports
-  #rgb/#rrggbb, rgb(), rgba(), var() recursion, and alpha compositing over an
-  opaque background.  Values that cannot be resolved without guessing —
-  color-mix(), gradients, and image backgrounds — are listed in :skipped.
-  A skipped item may never be one of the six required probes.
+  The test parses `resources/public/css/workbench.css` as the single source of
+  the theme palettes: light, dark, and high contrast each resolve from their
+  own declaration block, so a high-contrast run cannot silently reuse the
+  light palette.  Banner rules live in the conversation surface's inline CSS,
+  which this test also reads; their backgrounds are solid `--wb-banner-*`
+  tokens declared in `workbench.css`.
+
+  It supports #rgb/#rrggbb, rgb(), rgba(), var() recursion, and alpha
+  compositing over an opaque background.  Values that cannot be resolved
+  without guessing — color-mix(), gradients, and image backgrounds — are
+  listed in :skipped.  A skipped item may never be one of the required probes.
 
   Limitation: this is a color-pair calculation, not a screenshot.  It proves
   the declared foreground/background pair, not anti-aliasing, font weight,
-  translucency stacking, or themed third-party widgets.  Banner styles whose
-  background is color-mix live in the conversation surface's inline CSS, so
-  the error/success probes here use the solid error-message and success-badge
-  surfaces declared in workbench.css."
+  translucency stacking, or themed third-party widgets."
   (:require [clojure.java.io :as io]
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]])
@@ -22,12 +23,46 @@
 
 (def ^:private css-path "resources/public/css/workbench.css")
 
+(def ^:private conversation-view-path "src/hc/client/conversation/view.cljs")
+
+(def ^:private conversation-css-marker "(def ^:private css")
+
 (def ^:private project-root
   (or (System/getProperty "hc.project.root")
       (System/getProperty "user.dir")))
 
 (defn- css-source []
   (slurp (io/file project-root css-path)))
+
+(defn- conversation-css
+  "Return the inline stylesheet of the conversation surface, unescaped.
+
+  The surface owns its `.hc-*` rules, so the banner declarations are read
+  from here instead of being copied into the workbench stylesheet.  The
+  extraction walks a real Clojure string literal (quote plus backslash
+  escapes) rather than regexing the whole file."
+  []
+  (let [text (slurp (io/file project-root conversation-view-path))
+        marker-at (string/index-of text conversation-css-marker)
+        open (when marker-at (string/index-of text "\"" marker-at))
+        close (when open
+                (loop [i (inc open) escaped? false]
+                  (when (< i (count text))
+                    (let [character (.charAt text i)]
+                      (cond
+                        escaped? (recur (inc i) false)
+                        (= character \\) (recur (inc i) true)
+                        (= character \") i
+                        :else (recur (inc i) false))))))]
+    (when (and open close)
+      (string/replace (subs text (inc open) close) "\\\"" "\""))))
+
+(defn- probe-css
+  "workbench.css followed by the surface's inline CSS.  The concatenation
+  mirrors load order: a rule in the surface wins over an equal-specificity
+  rule in the linked stylesheet."
+  []
+  (str (css-source) "\n" (conversation-css)))
 
 (defn- strip-comments [css]
   (string/replace css #"(?s)/\*.*?\*/" ""))
@@ -63,7 +98,13 @@
         high (block-vars css "html[data-contrast=\"high\"]")]
     {:light (merge root light)
      :dark (merge root dark)
-     :high-contrast (merge root light high)}))
+     ;; High contrast is resolved from its own block only.  Merging the light
+     ;; block would let a missing high-contrast declaration inherit a light
+     ;; value and pass silently, which is the drift this test must catch.
+     ;; `:high-block` exposes the raw block so a test can prove it is not
+     ;; empty and differs from light.
+     :high-contrast (merge root high)
+     :high-block high}))
 
 ;; ---------------------------------------------------------------------------
 ;; Color parsing and WCAG math
@@ -293,10 +334,29 @@
 ;; ---------------------------------------------------------------------------
 ;; Probes
 
-(def ^:private required-probe-ids
-  #{:body :muted :accent-link :error-bar :success-bar :primary-button})
+(def ^:private base-palette-vars
+  ["--wb-bg" "--wb-surface" "--wb-surface-2"
+   "--wb-ink" "--wb-ink-muted" "--wb-line"
+   "--wb-accent" "--wb-accent-ink"
+   "--wb-danger" "--wb-warn" "--wb-ok"])
 
-(defn- contrast-probes [css]
+(def ^:private banner-vars
+  ["--wb-banner-error-bg" "--wb-banner-warning-bg" "--wb-banner-info-bg"])
+
+(def ^:private palette-vars (into base-palette-vars banner-vars))
+
+(def ^:private all-themes [:light :dark :high-contrast])
+
+(def ^:private high-only [:high-contrast])
+
+(def ^:private required-probe-ids
+  #{:body :muted :accent-link :error-bar :success-bar :primary-button
+    :banner-error :banner-warning :banner-info})
+
+(def ^:private high-contrast-probe-ids
+  #{:hc-surface-muted :hc-border :hc-accent :hc-danger :hc-warn :hc-ok})
+
+(defn- contrast-probes []
   [{:id :body
     :label "正文"
     :fg {:var "--wb-ink"}
@@ -331,7 +391,99 @@
     :label "主按钮文字/背景（深色 H-17）"
     :fg {:rule ".hc-button-primary" :property "color"}
     :bg {:rule ".hc-button-primary" :property "background"}
+    :minimum 4.5}
+
+   ;; Banner bodies.  The surface paints its own rules; the backgrounds are
+   ;; solid --wb-banner-* tokens that workbench.css declares per theme.
+   {:id :banner-error
+    :label "错误横幅文字/背景"
+    :fg {:rule ".hc-banner-error" :property "color"}
+    :bg {:rule ".hc-banner-error" :property "background"}
+    :minimum 4.5}
+
+   {:id :banner-warning
+    :label "警告横幅文字/背景"
+    :fg {:rule ".hc-banner-warning" :property "color"}
+    :bg {:rule ".hc-banner-warning" :property "background"}
+    :minimum 4.5}
+
+   {:id :banner-info
+    :label "信息横幅文字/背景"
+    :fg {:rule ".hc-banner-info" :property "color"}
+    :bg {:rule ".hc-banner-info" :property "background"}
+    :minimum 4.5}
+
+   ;; High contrast gets its own probes.  `data-contrast="high"` may sit on
+   ;; top of any theme, so its muted text, borders and status colours must be
+   ;; verified against the palette that actually wins, not against light.
+   {:id :hc-surface-muted
+    :label "高对比：卡片上的次要文字"
+    :themes high-only
+    :fg {:var "--wb-ink-muted"}
+    :bg {:var "--wb-surface"}
+    :minimum 4.5}
+
+   {:id :hc-border
+    :label "高对比：边框线"
+    :themes high-only
+    :fg {:var "--wb-line"}
+    :bg {:var "--wb-surface"}
+    :minimum 3.0}      ; WCAG 1.4.11 non-text contrast
+
+   {:id :hc-accent
+    :label "高对比：accent 文字"
+    :themes high-only
+    :fg {:var "--wb-accent"}
+    :bg {:var "--wb-surface"}
+    :minimum 4.5}
+
+   {:id :hc-danger
+    :label "高对比：danger 文字"
+    :themes high-only
+    :fg {:var "--wb-danger"}
+    :bg {:var "--wb-surface"}
+    :minimum 4.5}
+
+   {:id :hc-warn
+    :label "高对比：warn 文字"
+    :themes high-only
+    :fg {:var "--wb-warn"}
+    :bg {:var "--wb-surface"}
+    :minimum 4.5}
+
+   {:id :hc-ok
+    :label "高对比：ok 文字"
+    :themes high-only
+    :fg {:var "--wb-ok"}
+    :bg {:var "--wb-surface"}
     :minimum 4.5}])
+
+(defn- probes-for-theme [theme]
+  (filter #(contains? (set (or (:themes %) all-themes)) theme)
+          (contrast-probes)))
+
+(defn- palette-tokens
+  "Resolve every palette token to {:var :color}.  A token that does not
+  resolve is kept with a nil :color so its failure is visible to the caller
+  instead of shrinking the collection."
+  [theme]
+  (mapv (fn [variable]
+          (let [raw (get theme variable)
+                resolved (when raw (resolve-vars theme raw))]
+            {:var variable
+             :color (when (= :ok (:status resolved))
+                      (parse-color (:value resolved)))}))
+        palette-vars))
+
+(defn- palette-colors
+  "The distinct resolved colors of a palette.  Duplicates such as two white
+  tokens collapse, which is the point: the set answers \"does high contrast
+  paint the same colors as light?\""
+  [theme]
+  (->> (palette-tokens theme)
+       (keep :color)
+       (map #(select-keys % [:r :g :b :a]))
+       set))
 
 (defn- skipped-css-declarations [css]
   (for [{:keys [selector body]} (css-blocks css)
@@ -354,14 +506,71 @@
 
 (deftest palette-themes-define-the-required-variables
   (let [themes (theme-vars (css-source))]
-    (doseq [theme [:light :dark :high-contrast]]
+    (doseq [theme all-themes]
       (testing (str theme " theme")
-        (doseq [variable ["--wb-bg" "--wb-surface" "--wb-surface-2"
-                          "--wb-ink" "--wb-ink-muted" "--wb-line"
-                          "--wb-accent" "--wb-accent-ink"
-                          "--wb-danger" "--wb-warn" "--wb-ok"]]
+        (doseq [variable palette-vars]
           (is (string? (get-in themes [theme variable]))
               (str theme " is missing " variable)))))))
+
+(deftest high-contrast-declares-its-own-palette
+  (testing "the data-contrast=high block carries real color values"
+    (let [high-block (:high-block (theme-vars (css-source)))]
+      (is (not (empty? high-block))
+          "html[data-contrast=\"high\"] must declare variables, not only color-scheme")
+      (doseq [variable palette-vars]
+        (is (string? (get high-block variable))
+            (str "high contrast must declare its own " variable)))))
+  (testing "high contrast resolves differently from light"
+    (let [themes (theme-vars (css-source))
+          tokens (fn [theme] (palette-tokens (get themes theme)))
+          light-tokens (tokens :light)
+          high-tokens (tokens :high-contrast)]
+      (is (every? :color light-tokens)
+          (str "every light token must resolve: "
+               (pr-str (remove :color light-tokens))))
+      (is (every? :color high-tokens)
+          (str "every high-contrast token must resolve: "
+               (pr-str (remove :color high-tokens))))
+      (let [light-colors (palette-colors (:light themes))
+            high-colors (palette-colors (:high-contrast themes))]
+        (println (format "PALETTE-COLORS theme=light count=%d %s"
+                         (count light-colors) (pr-str (sort-by str light-colors))))
+        (println (format "PALETTE-COLORS theme=high-contrast count=%d %s"
+                         (count high-colors) (pr-str (sort-by str high-colors))))
+        (is (not= light-colors high-colors)
+            "the high-contrast palette must differ from the light palette")
+        (is (not= "#ffffff" (:resolved (resolve-vars (:light themes)
+                                                     "--wb-ink")))
+            "light ink is not white; a shared all-white set would prove nothing")
+        (doseq [{:keys [var]} high-tokens
+                :let [raw (get-in themes [:high-contrast var])
+                      light-raw (get-in themes [:light var])]
+                :when (and (string? raw) (string? light-raw))]
+          (is (or (not= raw light-raw)
+                  (= var "--wb-surface")
+                  (= var "--wb-accent-ink")
+                  (= var "--wb-bg"))
+              (str var " must not repeat the light value unless it is a "
+                   "deliberately shared white/grey token (" light-raw ")")))))))
+
+(deftest banners-use-solid-resolvable-backgrounds
+  (let [css (probe-css)
+        themes (theme-vars css)]
+    (doseq [banner [".hc-banner-error" ".hc-banner-warning" ".hc-banner-info"]]
+      (let [raw (declaration-value css banner "background")]
+        (is (some? raw) (str banner " must declare a background"))
+        (is (not (string/includes? (str raw) "color-mix("))
+            (str banner " must not use color-mix(); a static test cannot resolve it"))
+        (doseq [theme all-themes]
+          (let [bg (resolved-color (get themes theme) css
+                                   {:rule banner :property "background"})]
+            (is (= :ok (:status bg))
+                (format "%s/%s background must resolve to a solid color: %s"
+                        theme banner (pr-str bg)))
+            (when (= :ok (:status bg))
+              (is (opaque (:color bg))
+                  (format "%s/%s background must be opaque: %s"
+                          theme banner (pr-str bg))))))))))
 
 (deftest color-parser-and-var-resolution-cover-the-required-forms
   (let [themes (theme-vars (css-source))]
@@ -390,11 +599,10 @@
         "alpha compositing still distinguishes the result from black")))
 
 (deftest required-contrast-pairs-meet-wcag
-  (let [css (css-source)
-        themes (theme-vars css)
-        probes (contrast-probes css)]
-    (doseq [theme [:light :dark :high-contrast]
-            probe probes]
+  (let [css (probe-css)
+        themes (theme-vars css)]
+    (doseq [theme all-themes
+            probe (probes-for-theme theme)]
       (let [fg (resolved-color (get themes theme) css (:fg probe))
             bg (resolved-color (get themes theme) css (:bg probe))]
         (if (or (= :skipped (:status fg))
@@ -432,11 +640,11 @@
                    minimum)))))))))
 
 (deftest skipped-items-never-hide-required-probes
-  (let [css (css-source)
+  (let [css (probe-css)
         themes (theme-vars css)
         probe-skips
-        (for [theme [:light :dark :high-contrast]
-              probe (contrast-probes css)
+        (for [theme all-themes
+              probe (probes-for-theme theme)
               :let [fg (resolved-color (get themes theme) css (:fg probe))
                     bg (resolved-color (get themes theme) css (:bg probe))]
               :when (or (= :skipped (:status fg))
@@ -447,7 +655,8 @@
            :reason (or (:reason (when (= :skipped (:status fg)) fg))
                        (:reason (when (= :skipped (:status bg)) bg)))
            :probe (:id probe)})
-        skipped (vec (concat (skipped-css-declarations css) probe-skips))]
+        skipped (vec (concat (skipped-css-declarations css) probe-skips))
+        required (into required-probe-ids high-contrast-probe-ids)]
     (println (format "SKIPPED count=%d" (count skipped)))
     (doseq [item skipped]
       (println (format "SKIP selector=%s property=%s value=%s reason=%s"
@@ -455,7 +664,7 @@
                        (:property item)
                        (:value item)
                        (:reason item))))
-    (is (not-any? #(contains? required-probe-ids (:probe %)) skipped)
+    (is (not-any? #(contains? required (:probe %)) skipped)
         (str "a required probe was skipped: "
-             (pr-str (filter #(contains? required-probe-ids (:probe %))
+             (pr-str (filter #(contains? required (:probe %))
                              skipped))))))
