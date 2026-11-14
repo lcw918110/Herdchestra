@@ -89,16 +89,6 @@
 - **建议**：发布前用 `scripts/release-gate.sh` 的六处版本断言；tag 推送前核对 `v0.0.x^{commit}` 的四个 manifest 与源码/freeze tree；修正 tag 时用 `GIT_INDEX_FILE` 临时 index，禁止 `reset --hard` 或重建源码提交。
 - **证据**：`HACK.md` §17.20；`plans/0.0.3-release-notes.md` 「0.0.2 标签修正」。
 
-## D-45 浏览器录音（WebM）无法使用云端语音识别
-
-- **条款**：云端 STT 必须能验证录音容器时长（安全边界）。
-- **位置**：`src/hc/server/speech.clj` 的 `:processing :cloud` 分支要求容器时长可验证；`src/hc/server/speech/audio.clj` 的 `duration-ms` 仅解析 WAV。
-- **缺口/现象**：客户端 `POST /speech/recordings` 返回 400 `SPEECH_DURATION_UNVERIFIABLE`，provider 从未被调用；UI 显示「the recording duration cannot be verified; a cloud service will not receive it」，录音保留但无法云端转写。本地（device）STT 不受影响。
-- **影响**：用户在浏览器里录音后选择云端 STT 必然失败；本地 STT 路径仍可用。
-- **现有取证**：`test/hc/server/speech/loopback_test.clj` 已把该拒绝固化为设计行为（安全性正确），因此这是**能力缺口**而非回归。
-- **建议处理**：三选一——(a) 客户端录制后转 WAV 再上传；(b) 服务端实现可验证的 WebM 时长解析（EBML Duration 元素）；(c) 在 UI 明确禁用「浏览器录音 + 云端 STT」组合并给出替代路径。任选其一都需同时更新该回归测试与 E2E 15。
-- **优先级**：中；不阻塞本次发布（本地 STT 路径可用，且拒绝行为安全）。
-
 ## D-46 E2E 21 的证据哈希口径与标准公式不可直接比较
 
 - **条款**：E2E 证据必须使用统一、可比较的 `sourceTreeSha256` 口径。
