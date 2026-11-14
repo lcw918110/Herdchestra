@@ -29,5 +29,6 @@
 - **实测**：77 496 字符的文档，`normalize` 单次 8.11 ms，其中 `digest` 4.40 ms（54%）、`pr-str count` 1.12 ms。真实 Datalevin 提交 400 轮（344 502 字符）耗时 76.99 ms——即使文档体积已被 D-37 的三处修复压到原来的 28%，提交仍远超 20 ms。
 - **影响**：这是长会话提交成本的最大单项来源，高于 LMDB 写入（2.5%）与 fsync。D-37 修完体积后，它成为唯一的主导项。
 - **不建议的做法**：把 `:max-doc-chars` 检查删掉——它是 `:OWNER_STATE_TOO_LARGE` 唯一来源，删掉会让超限文档静默写入而非明确拒绝（`test/hc/server/storage/owner_state_size_test.clj` 专门锁这条）。把 `digest` 改成弱校验——digest 是迁移幂等与冲突判据，削弱它等于削弱存储合同。
-- **建议方向**：让 `normalize` 只序列化一次并把结果复用于长度检查与 digest 输入；`canonical-form` 的比较器需要稳定 key 序，可改用不依赖 `pr-str` 的等价比较（key 多为 keyword/string，天然可比），仅对混合类型 key 回退到 `pr-str`。改动触及存储核心，必须同时验证 `owner_state_size_test`、`owner_store_retry_test` 与幂等/冲突语义。
+- **建议方向**：让 `normalize` 只序列化一次并把结果复用于长度检查与 digest 输入。改动触及存储核心，必须同时验证 `owner_state_size_test`、`owner_store_retry_test` 与幂等/冲突语义。
+- **已排除的做法**：不能把 `canonical-form` 的比较器换成 `compare`。实测 `(sort compare [:b "a" :a "b" :c "B"])` 直接抛 `ClassCastException`——`compare` 无法比较 `Keyword` 与 `String`。`pr-str` 比较器不是冗余，它是唯一能对混合 key 类型给出全序的办法；Owner 状态的 key 实测只有 `String` 与 `Keyword` 两种，正好落在 `compare` 办不到的区间。而且它的排序结果（String 在前、Keyword 在后）已经是 digest 的一部分，换掉会改变所有已存数据的 digest，破坏幂等比对。**这一项不是缺陷，是正确设计。** 因此 D-48 的可优化空间只剩「大小检查与 digest 复用同一次序列化」，上限约 14%（大小检查占 1.12/8.11 ms）。
 - **触发条件**：任何会话进入 300 轮以上，或单次提交观测到超过 50 ms。
