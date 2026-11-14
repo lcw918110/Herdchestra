@@ -53,6 +53,19 @@ The tool executor is injected.  A result is
 `{:status :ok|:failed :text "..."}`.  `hc.server.app.devops/tool-executor`
 implements the real read-only workspace adapter.
 
+### Recoverable `call` ledger (D-47)
+
+`call` runs a managed shell inside the worker thread, so a hard process
+stop would otherwise leave no Owner-side record.  The executor accepts an
+optional `:call-ledger` with `:start!`/`:finish!`; the app supplies a port
+that commits `:worker-call/start` and `:worker-call/finish` through the
+Owner mailbox.  `:start!` is committed before the helper runs, and a
+refused start means the helper is not run.  After a restart,
+`hc.compose.owner.state/recover-state` marks any still-`:running` record
+`:outcome-unknown`; `hc.server.app.snapshot` publishes it beside scheduler
+calls in `:unresolved-calls`, and the operator closes it with `:call/ack`.
+The worker never writes Owner state directly (§5.1).
+
 ### Continuations (`park` / `unpark`)
 
 `park` and `unpark` are worker-loop continuations, not adapter no-ops:
