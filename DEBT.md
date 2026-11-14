@@ -33,16 +33,6 @@
 - **建议**：在 `sessions` 分区维护与索引更新同事务的 committed session count，健康端点读取该计数；若继续接受 O(N)，在 `HACK.md` 记录预算、测量口径与超过阈值时的降级为 `:unknown`。
 - **证据**：`src/hc/server/app/system.clj:5566-5580,5789-5801`；`src/hc/server/app/session_persistence.clj:443-445` 返回完整 `:ids`；已有测量为 1000 会话约 1.6 ms。
 
-## D-43 0.0.2 tag 曾发布 0.0.1 版本号（已用 fixup 修正，保留为流程记录）
-
-- **条款**：发布流程（版本 manifest、tag 与源码树一致性）。
-- **事故**：`v0.0.2` 原树的四个 manifest 版本号仍全是 `0.0.1`，推送后成为「自称 0.0.1 的 0.0.2」。涉及 `src/hc/version.cljc`、`pixi.toml`、`package.json`、`package-lock.json`。
-- **修正**：现 `v0.0.2` 指向 fixup 提交 `721c1b2`（annotated tag object `cb87d76`），其父为 `1623d4e`（原 0.0.2 source release，freeze tree `956136d0`、bundle `fd5e1f90`）。`git diff --name-status v0.0.2^{commit}^ v0.0.2^{commit}` 恰好 4 行、全部 `M`；`4 files changed, 5 insertions(+), 5 deletions(-)`；`package-lock.json` 第 13 行起逐字节相同（58302 B = 58302 B），依赖树零改动。
-- **远端**：`refs/heads/master = 721c1b2…`（原 `379b021`）；`refs/tags/v0.0.1^{} = 40d01c8…`；`refs/tags/v0.0.2^{} = 721c1b2…`；无其它 `v0.0.*` 标签。本地保底分支 `release-0.0.2-source`（指向 `1623d4e`）未推送。
-- **状态**：已修正并推送；本条是已关闭事故的保留记录，不进入待办队列。临时 index 的复现命令骨架见 `HACK.md` §17.20。
-- **建议**：发布前用 `scripts/release-gate.sh` 的六处版本断言；tag 推送前核对 `v0.0.x^{commit}` 的四个 manifest 与源码/freeze tree；修正 tag 时用 `GIT_INDEX_FILE` 临时 index，禁止 `reset --hard` 或重建源码提交。
-- **证据**：`HACK.md` §17.20；`plans/0.0.3-release-notes.md` 「0.0.2 标签修正」。
-
 ## D-46 E2E 21 的证据哈希口径与标准公式不可直接比较
 
 - **条款**：E2E 证据必须使用统一、可比较的 `sourceTreeSha256` 口径。

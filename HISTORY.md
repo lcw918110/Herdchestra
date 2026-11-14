@@ -377,3 +377,22 @@
 **限制**
 - 结构检查只证明字符串存在，不证明 16 处条款语义正确或 §7.4 信息保全完整；信息保全为 best-effort。
 - DEBT.md 已删除 D-02；存储写入按 §7.1 fail-fast 处理。
+
+## 2026-11-14 0.0.2 标签曾指向 0.0.1 的版本号
+
+### 事故
+
+- `v0.0.2` 原树的四个 manifest 版本号仍全是 `0.0.1`，推送后成为「自称 0.0.1 的 0.0.2」。涉及 `src/hc/version.cljc`、`pixi.toml`、`package.json`、`package-lock.json`。
+- 现象之所以危险：标签名是对的，内容也对，只有版本号说谎。任何按 `v0.0.2^{commit}` 读 manifest 的下游都会得到 0.0.1。
+
+### 裁决与修正
+
+- 现 `v0.0.2` 指向 fixup 提交 `721c1b2`（annotated tag object `cb87d76`），其父为 `1623d4e`（原 0.0.2 source release，freeze tree `956136d0`、bundle `fd5e1f90`）。
+- `git diff --name-status v0.0.2^{commit}^ v0.0.2^{commit}` 恰好 4 行、全部 `M`；`4 files changed, 5 insertions(+), 5 deletions(-)`；`package-lock.json` 第 13 行起逐字节相同（58302 B = 58302 B），依赖树零改动。
+- 远端当时状态：`refs/heads/master = 721c1b2…`（原 `379b021`）；`refs/tags/v0.0.1^{} = 40d01c8…`；`refs/tags/v0.0.2^{} = 721c1b2…`；无其它 `v0.0.*` 标签。本地保底分支 `release-0.0.2-source`（指向 `1623d4e`）未推送。
+
+### 代价
+
+- 修正标签需要改写既有 tag。这是不可逆的远端操作，只能靠逐字节相等的 lock 文件与「只改 4 行版本号」的 diff 证明没夹带别的东西。
+- 修正 tag 时用 `GIT_INDEX_FILE` 临时 index，禁止 `reset --hard` 或重建源码提交。
+- 发布前用 `scripts/release-gate.sh` 的六处版本断言；tag 推送前核对 `v0.0.x^{commit}` 的四个 manifest 与源码/freeze tree。复现命令骨架见 `HACK.md` §17.20。
