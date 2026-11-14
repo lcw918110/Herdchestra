@@ -216,6 +216,7 @@
     (if blocker
       (outcome state :send :blocked
                {:reason blocker
+                :session-id session-id
                 :intent (composer/send-intent blocker)
                 :message (case blocker
                            :empty "输入为空，草稿已保留"
@@ -278,6 +279,7 @@
           (outcome :send :blocked
                    {:intent (:intent decision)
                     :reason (:reason decision)
+                    :session-id session-id
                     :message (:message decision)})))))
 
 ;; ---------------------------------------------------------------------------

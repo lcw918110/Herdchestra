@@ -247,6 +247,7 @@
                                       model (:session state))
                  :connection (:connection state)
                  :run-active? (boolean (:run-active? state))}
+        last-outcome (:last-outcome state)
         blocker (composer/send-blocker context)
         intent (composer/send-intent blocker)
         decision (composer/send-decision context)
@@ -291,8 +292,23 @@
                                  "模型设置通道未就绪")
                        :defer-label "稍后设置"
                        :defer? has-settings?}))
-     :target-size (a11y/target-size layout :primary)
-     :aria-label "发送消息"}))
+    :target-size (a11y/target-size layout :primary)
+    ;; D-51: a refused send must say why.  The render layer used to return
+    ;; nil for `:duplicate`/`:wait`/`:unattended`, so the reducer's own
+    ;; `:blocked` message never reached the operator: the draft stayed in the
+    ;; box and nothing explained it.  Surface the last send refusal here, but
+    ;; only while it still belongs to this session and to this moment — a
+    ;; refusal left over from another session, or from three rounds ago, must
+    ;; not keep nagging.
+    :refusal (let [{:keys [kind result reason message session-id]} last-outcome]
+               (when (and (= :send kind)
+                          (= :blocked result)
+                          (= session-id (:session-id state))
+                          (string? message)
+                          (not (str/blank? message)))
+                 {:reason reason
+                  :message message}))
+    :aria-label "发送消息"}))
 
 (defn- stop-view
   [stream-state callbacks layout session-id run-active?]

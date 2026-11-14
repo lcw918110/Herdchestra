@@ -501,6 +501,170 @@
         (is (= "second" (get-in confirmed [:drafts "s1" :text])))))))
 
 ;; ---------------------------------------------------------------------------
+;; Snapshot send: what it clears, and what it must not
+(deftest snapshot-clears-run-active-but-not-command-pending
+  ;; A captured send carries the operator's explicitly typed text at submit
+  ;; time.  That proves a *new* round is intended, so the previous round's
+  ;; automatic continuation sentinel (`run-active?` -> `:unattended`) must not
+  ;; block it.  It proves nothing about a send command still in flight for
+  ;; the same content: `command-pending?` exists to stop the operator
+  ;; submitting the same message twice.  Clearing both is how `:duplicate`
+  ;; became a silent no-op, and how widening the `request-send!` allow-list
+  ;; could turn that silence into a real double submit.
+  ;;
+  ;; The send-blocker order puts `:generating` ahead of `:command-pending`,
+  ;; so this contract is only observable once the visible stream is no
+  ;; longer generating.  That is exactly the window D-51 complains about:
+  ;; the operator presses Enter again after the answer finished but before
+  ;; the send receipt arrived.
+  (let [state (-> (base) (edit "s1" "hello") send!)
+        command-id (get-in state [:outbox 0 :command-id])
+        _ (is (string? command-id) "the first send is queued and in flight")
+        idle (-> state
+                 (assoc-in [:streams "s1" :streaming?] false)
+                 (assoc-in [:streams "s1" :stop-state] :stopped))
+        _ (is (true? (conv/pending-command? idle "s1" :send))
+              "the send receipt has not arrived yet")
+        typed (edit idle "s1" "different text")
+        captured (conv/apply-action
+                  typed
+                  {:type :composer/send
+                   :session-id "s1"
+                   :at "t"
+                   :snapshot {:text "different text"
+                              :attachments []
+                              :quotes []
+                              :version 2}})]
+    (is (= :command-pending (get-in captured [:last-outcome :reason]))
+        "a captured send must not bypass the in-flight duplicate guard")
+    (is (= :blocked (get-in captured [:last-outcome :result]))
+        "the refusal is visible, not silent")
+    (is (= 1 (count (outbox captured)))
+        "no second command was queued")))
+
+(deftest snapshot-clears-the-unattended-sentinel
+  (let [state (-> (base)
+                  (assoc :run-active? true)
+                  (edit "s1" "next round"))
+        captured (conv/apply-action
+                  state
+                  {:type :composer/send
+                   :session-id "s1"
+                   :at "t"
+                   :snapshot {:text "next round"
+                              :attachments []
+                              :quotes []
+                              :version 1}})]
+    (is (= :queued (get-in captured [:last-outcome :result]))
+        "an explicit send starts a new round even while a run is active")
+    (is (= 1 (count (outbox captured))))))
+
+;; ---------------------------------------------------------------------------
+;; D-51: a refused send must be visible
+;;
+;; The render layer used to short-circuit `:duplicate`, `:wait` and
+;; `:unattended` by returning nil.  The reducer knew the reason, the operator
+;; never saw it, and the draft stayed in the box: every refusal looked like a
+;; race.  These pin the contract on both sides — the reducer records which
+;; session refused, and the surface only re-publishes a refusal that still
+;; belongs to the session being rendered.
+
+(defn- view
+  [state]
+  (surface/surface {:conversation state
+                    :session session
+                    :connection {:phase :synced}
+                    :messages []
+                    :callbacks {:send! identity :stop! identity}}))
+
+(deftest blocked-send-publishes-a-visible-refusal
+  ;; `:generating` already reaches the operator as a two-option decision, so
+  ;; it is not the gap.  `:unattended` and `:stopping` are: the render layer
+  ;; dropped both keys and nothing rendered the reducer's verdict.
+  (let [unattended (-> (base)
+                       (conv/apply-action
+                        {:type :session/select
+                         :session-id "s1"
+                         :session (assoc session :run-status :running)
+                         :model {:id "m1" :display-name "Main"}
+                         :connection {:phase :synced}})
+                       (edit "s1" "hello")
+                       (send!))
+        refusal (get-in (view unattended) [:composer :send :refusal])]
+    (is (= :blocked (get-in unattended [:last-outcome :result]))
+        "the reducer refuses the send")
+    (is (= :unattended (get-in unattended [:last-outcome :reason])))
+    (is (= "s1" (get-in unattended [:last-outcome :session-id]))
+        "the refusal remembers which session refused")
+    (is (= "无人值守运行中，可停止当前轮后再发送" (:message refusal))
+        "the surface turns the verdict into operator-visible text")
+    (is (= :unattended (:reason refusal))))
+  (testing "a stopping round also explains itself"
+    (let [stopping (-> (base)
+                       (edit "s1" "hello")
+                       (conv/apply-action {:type :composer/stop
+                                           :session-id "s1"
+                                           :at "t"})
+                       (send!))
+          refusal (get-in (view stopping) [:composer :send :refusal])]
+      (is (= :stopping (get-in stopping [:last-outcome :reason])))
+      (is (= "正在停止当前轮" (:message refusal))))))
+
+(deftest refusal-does-not-leak-across-sessions
+  (let [refused (-> (base)
+                    (conv/apply-action {:type :session/select
+                                        :session-id "s1"
+                                        :session (assoc session :run-status :running)
+                                        :model {:id "m1" :display-name "Main"}
+                                        :connection {:phase :synced}})
+                    (edit "s1" "hello")
+                    (send!))]
+    (is (some? (get-in (view refused) [:composer :send :refusal]))
+        "s1 really refused a send")
+    (let [switched (-> refused
+                       (conv/apply-action {:type :session/select
+                                           :session-id "s2"
+                                           :session (assoc session :id "s2")
+                                           :model {:id "m1" :display-name "Main"}
+                                           :connection {:phase :synced}})
+                       (edit "s2" "other"))]
+      (is (nil? (get-in (view switched) [:composer :send :refusal]))
+          "a refusal recorded for s1 must not appear in s2's composer"))))
+
+(deftest refusal-clears-when-the-blocker-goes-away
+  ;; A refusal that keeps rendering after the blocker cleared would be its own
+  ;; lie: the operator would read "正在停止当前轮" while the round already
+  ;; settled.  The composer only shows the newest send verdict.
+  (let [stopping (-> (base)
+                     (conv/apply-action {:type :composer/stop
+                                         :session-id "s1"
+                                         :at "t"})
+                     (send!))
+        settled (conv/apply-action stopping
+                                   {:type :stream/finished
+                                    :session-id "s1"})]
+    (is (some? (get-in (view stopping) [:composer :send :refusal])))
+    (is (nil? (get-in (view settled) [:composer :send :refusal]))
+        "once the stream settles, the stale refusal stops rendering")))
+
+(deftest refusal-requires-a-message
+  (let [state (-> (base) (assoc :last-outcome {:kind :send :result :blocked}))]
+    (is (nil? (get-in (view state) [:composer :send :refusal]))
+        "a blocked outcome without text is not operator-visible"))
+  (let [state (-> (base) (assoc :last-outcome {:kind :send
+                                                :result :blocked
+                                                :message "   "
+                                                :session-id "s1"}))]
+    (is (nil? (get-in (view state) [:composer :send :refusal]))
+        "blank text is not a reason"))
+  (let [state (-> (base) (assoc :last-outcome {:kind :stop
+                                                :result :blocked
+                                                :message "停止失败"
+                                                :session-id "s1"}))]
+    (is (nil? (get-in (view state) [:composer :send :refusal]))
+        "only send refusals belong in the composer")))
+
+;; ---------------------------------------------------------------------------
 ;; Ask cards
 
 (deftest s1-ask-card-lifecycle

@@ -74,6 +74,7 @@
 .hc-button-primary{background:var(--f7-color-primary,#0a84ff);border-color:var(--f7-color-primary,#0a84ff);color:#fff}
 .hc-button[disabled],.hc-button[aria-disabled=true]{opacity:.55;cursor:not-allowed}
 .hc-composer-hint,.hc-composer-save{font-size:.78rem;color:var(--f7-label-color,#555)}
+.hc-composer-refusal{font-size:.78rem;font-weight:600;color:var(--f7-color-red,#d70015)}
 .hc-reason{font-size:.8rem;font-weight:600;color:var(--f7-label-color,#555)}
 .hc-attachments,.hc-quotes,.hc-ask-answers{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none}
 .hc-chip{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:6px 8px;border:1px solid var(--f7-list-item-border-color,#d8d8dc);border-radius:8px;font-size:.82rem}
@@ -1768,10 +1769,18 @@
       ;; the key silently there is a data-loss bug the operator cannot see —
       ;; the draft stays in the box and nothing explains why.  So when the
       ;; visible field holds real text, hand the DOM snapshot to the bridge,
-      ;; which decides from the state at submit time.  `:duplicate` and
-      ;; `:wait` still short-circuit: those describe an in-flight command the
-      ;; operator must not silently double-submit.
-      (and (contains? #{:disabled :select-model} intent)
+      ;; which decides from the state at submit time.
+      ;;
+      ;; D-51: `:duplicate`, `:wait` and `:unattended` were in this
+      ;; short-circuit too, and they returned nil — no command, no bubble, no
+      ;; notice, draft untouched.  The reducer already knows how to refuse
+      ;; them with a reason (`send-blocker` is the single authority), and the
+      ;; composer now renders that verdict, so let the reducer answer instead
+      ;; of throwing the key away here.  The snapshot path must not clear
+      ;; `command-pending?`: D-52 pins that an in-flight send still blocks a
+      ;; second one.
+      (and (contains? #{:disabled :select-model :duplicate :wait :unattended}
+                      intent)
            (let [value (some-> textarea-ref .-current .-value)]
              (string? value)
              (not (str/blank? value))))
@@ -1785,7 +1794,7 @@
               (.setSelectionRange node 0 0))))
         result)
 
-      (contains? #{:disabled :duplicate :wait :select-model} intent)
+      (contains? #{:disabled :duplicate :wait :select-model :unattended} intent)
       nil
 
       (fn? (:send! callbacks))
@@ -2185,6 +2194,15 @@
                       (:hint composer)
                       (when-let [reason (:reason send)]
                         (str " · " reason)))
+             (when-let [refusal (:refusal send)]
+               ;; D-51: a refused send used to leave the draft sitting in the
+               ;; box with no explanation, which made every rejection look
+               ;; like a race.  `role="alert"` so it is announced, not only
+               ;; seen.
+               (dom/div {:className "hc-composer-refusal"
+                         :role "alert"
+                         :aria-live "polite"}
+                        (:message refusal)))
              (when-let [save-label (get-in composer [:save :label])]
                (dom/div {:className "hc-composer-save" :role "status"} save-label))
              (when-let [command-reason
