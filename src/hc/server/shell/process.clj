@@ -292,7 +292,13 @@
    (stop-tree! process known {}))
   ([^java.lang.Process process known {:keys [grace-ms settle-ms]
                                       :or {grace-ms 2000 settle-ms 150}}]
-   (let [signal-errors (atom [])
+   ;; D-48: the settle window exists so `sh` can finish forking before the
+   ;; first scan, but it must never outlast the grace it precedes.  A caller
+   ;; that asks for 300 ms of grace would otherwise spend at least 150 ms of
+   ;; it on a fixed pause it cannot see, and a caller that lowered grace
+   ;; below the settle got a stop dominated by a parameter it never passed.
+   (let [settle-ms (long (min (max 0 (long settle-ms)) (max 0 (long grace-ms))))
+         signal-errors (atom [])
          signal-sent? (atom false)
          forcibly? (atom false)
          ;; pid → :term / :kill, so a re-scan never restates a signal and an

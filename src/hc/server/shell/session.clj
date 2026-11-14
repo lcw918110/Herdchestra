@@ -30,6 +30,11 @@
   {:inline-output-bytes output/default-inline-limit
    :artifact-output-bytes output/default-artifact-limit
    :stop-grace-ms 2000
+   ;; D-48: how long the first signal waits for `sh` to finish forking.  It
+   ;; existed only as `stop-tree!`'s own default, so a session that changed
+   ;; `:stop-grace-ms` could not control it and a short grace lost to a fixed
+   ;; settle.
+   :stop-settle-ms 150
    :child-poll-ms 50
    :wait-poll-ms 50
    :drain-timeout-ms 500
@@ -662,7 +667,8 @@
         known (:known-children session)
         pumps (:pumps @state)
         limits (:limits runner)
-        _ (process/stop-tree! process known {:grace-ms (:stop-grace-ms limits)})
+        _ (process/stop-tree! process known {:grace-ms (:stop-grace-ms limits)
+                                            :settle-ms (:stop-settle-ms limits)})
         managed? (or (process/alive? process)
                      (seq (process/alive-known-children known)))
         pumps-alive? (boolean (some pump-alive? pumps))
@@ -765,7 +771,8 @@
                   (and stop? (not (:stop-signal-attempted? s)))
                   (let [result (process/stop-tree!
                                 process known
-                                {:grace-ms (:stop-grace-ms limits)})]
+                                {:grace-ms (:stop-grace-ms limits)
+                                 :settle-ms (:stop-settle-ms limits)})]
                     (swap! state assoc
                            :stop-signal-sent? (:signal-sent? result)
                            :stop-signal-attempted? true
@@ -1203,9 +1210,11 @@
   [runner session opts]
   (let [state (:state session)
         s @state
-        limits (update (merge (:limits runner)
-                              (select-keys (or opts {}) [:stop-grace-ms]))
-                       :stop-grace-ms #(or % 2000))
+        limits (-> (merge (:limits runner)
+                          (select-keys (or opts {})
+                                       [:stop-grace-ms :stop-settle-ms]))
+                   (update :stop-grace-ms #(or % 2000))
+                   (update :stop-settle-ms #(or % 150)))
         request-id (:request-id session)]
     (cond
       (and (:done? s)
@@ -1218,7 +1227,8 @@
       (:stop-requested? s)
       (if-let [process (:process s)]
         (let [result (process/stop-tree! process (:known-children session)
-                                         {:grace-ms (:stop-grace-ms limits)})]
+                                         {:grace-ms (:stop-grace-ms limits)
+                                          :settle-ms (:stop-settle-ms limits)})]
           (swap! state assoc
                  :stop-signalled-at (Instant/now)
                  :stop-signal-sent? (:signal-sent? result)
@@ -1243,7 +1253,8 @@
                :stop-requested-at (Instant/now))
         (if-let [process (:process s)]
           (let [result (process/stop-tree! process (:known-children session)
-                                           {:grace-ms (:stop-grace-ms limits)})]
+                                           {:grace-ms (:stop-grace-ms limits)
+                                            :settle-ms (:stop-settle-ms limits)})]
             (swap! state assoc
                    :stop-signalled-at (Instant/now)
                    :stop-signal-sent? (:signal-sent? result)

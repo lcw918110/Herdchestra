@@ -36,6 +36,7 @@ shell      public facade
                  :limits {:inline-output-bytes 1048576
                           :artifact-output-bytes 67108864
                           :stop-grace-ms 2000
+                          :stop-settle-ms 150  ; fork window, clamped to grace
                           :drain-timeout-ms 500
                           :child-poll-ms 50
                           :wait-poll-ms 50
