@@ -5869,20 +5869,23 @@
             health-system (fn []
                             {:store-open? #(storage/store-open? store)
                              :session-count (fn []
-                                              ;; The live `/healthz` route must
-                                              ;; not deserialize every session
-                                              ;; record; the committed id index
-                                              ;; is a point read.
-                                              (let [listed
+                                              ;; Constant time: the committed
+                                              ;; count document is written in
+                                              ;; the same transaction as the
+                                              ;; session index.  A missing or
+                                              ;; unreadable count degrades to
+                                              ;; `:unknown`; it never fails
+                                              ;; `/healthz`.
+                                              (let [counted
                                                     (try
-                                                      (session-ports/list-session-ids
+                                                      (session-ports/committed-session-count
                                                        persistence)
                                                       (catch Throwable _
                                                         {:status :unknown}))]
-                                                (case (:status listed)
-                                                  :ok (count (:ids listed))
-                                                  :unknown :unknown
-                                                  nil)))
+                                                (if (= :ok (:status counted))
+                                                  (let [n (:count counted)]
+                                                    (if (number? n) n :unknown))
+                                                  :unknown)))
                              :gateway-stats #(gateway/stats gateway-handle)
                              :model-configured? (some? model-port)
                              :owners (merge (:owner-errors @system-ref)
@@ -6097,20 +6100,24 @@
         (health/snapshot
      {:store-open? (fn [] (storage/store-open? (:store live)))
       :session-count (fn []
-                       ;; Counting reads the committed session-id index, a
-                       ;; point read.  It never calls `list-sessions`, which
-                       ;; deserializes every record and OOMs a large store.
-                       (let [persistence (:persistence live)
-                             listed (when persistence
-                                      (try
-                                        (session-ports/list-session-ids
-                                         persistence)
-                                        (catch Throwable _
-                                          {:status :unknown})))]
-                         (case (:status listed)
-                           :ok (count (:ids listed))
-                           :unknown :unknown
-                           nil)))
+                       ;; Constant time: the committed count document commits
+                       ;; with the session index.  It never calls
+                       ;; `list-sessions`, which deserializes every record and
+                       ;; OOMs a large store, and never counts ids, which is
+                       ;; linear in the session count.  A failed or absent
+                       ;; count degrades to `:unknown`; `/healthz` stays up.
+                       (if-let [persistence (:persistence live)]
+                         (let [counted
+                               (try
+                                 (session-ports/committed-session-count
+                                  persistence)
+                                 (catch Throwable _
+                                   {:status :unknown}))]
+                           (if (= :ok (:status counted))
+                             (let [n (:count counted)]
+                               (if (number? n) n :unknown))
+                             :unknown))
+                         :unknown))
       :gateway-stats (fn [] (gateway/stats (:gateway live)))
       :model-configured? (some? (:model-port live))
       :browser (into {}
