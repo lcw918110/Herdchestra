@@ -89,15 +89,6 @@
 - **建议**：发布前用 `scripts/release-gate.sh` 的六处版本断言；tag 推送前核对 `v0.0.x^{commit}` 的四个 manifest 与源码/freeze tree；修正 tag 时用 `GIT_INDEX_FILE` 临时 index，禁止 `reset --hard` 或重建源码提交。
 - **证据**：`HACK.md` §17.20；`plans/0.0.3-release-notes.md` 「0.0.2 标签修正」。
 
-## D-44 新建会话回执到达前立即发送可能落入上一个会话
-
-- **条款**：客户端会话创建/发送时序（E2E 稳定性要求：同类竞态必须在 UI 侧门控）。
-- **缺口**：用户点「新建会话」后，在 `:session/create` 回执到达前立刻发送，客户端尚未切换 selected session，消息可能落进上一个会话。E2E 侧已用 `newSession` 回执门控规避；产品侧未加门控。
-- **影响**：消息错投、草稿错位；用户看到会话归属错误，且后续上下文可能挂到错误会话。
-- **建议**：在 `:session/create` 回执前禁用发送，或把发送排队到 selected-session 更新之后；也可让命令携带 expected session id 并在回执校验，不匹配则拒绝而不是落盘。
-- **证据**：本轮 E2E 新建会话用例使用 helper 等待 `:session/create` 回执；产品侧无门控。
-- **补充证据（2026-11-11）**：E2E 19 在全新 data-dir 上稳定复现了同一竞态更隐蔽的一面。服务端启动时会预建一个空默认会话，因此 `newSession` 的「当前会话已有消息」判据恒为假，helper 点击后立即返回、不等回执；紧随其后的 Enter 命中本地门控 `:connection-not-ready`，消息被静默丢弃（草稿保留、无气泡），页面看似「连接中断」实为 teardown 后的遗照。测试侧已改为先等发送按钮可用再按 Enter；**产品侧门控仍未实现**，即本条缺口依旧成立。
-
 ## D-45 浏览器录音（WebM）无法使用云端语音识别
 
 - **条款**：云端 STT 必须能验证录音容器时长（安全边界）。
