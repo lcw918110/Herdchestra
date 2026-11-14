@@ -2540,12 +2540,48 @@
                            (artifacts-integration/register-executor-result!
                             a
                             {:session-id (:session-id terminal)
+                             :task-id (:task-id terminal)
                              :call-id (:tool-call-id terminal)
                              :executor (:name terminal)
                              :result (:result terminal)
+                             :workspace-root (:workspace-root config)
+                             ;; The notifier only marks the publisher dirty;
+                             ;; it cannot confirm the event reached a live
+                             ;; subscriber.  Announce acceptance is judged by
+                             ;; `register-and-announce!`, and an unaccepted
+                             ;; publish leaves the artifact unannounced for
+                             ;; the retry queue instead of claiming success.
                              :publish! (fn [_]
-                                         (when-let [f @notify-ref] (f)))}))
-                         (catch Throwable _ nil)))
+                                         (when-let [f @notify-ref] (f))
+                                         true)}))
+                         (catch Throwable t
+                           ;; The file may already exist in the workspace.
+                           ;; Swallowing this left the user with no card and
+                           ;; no way to find the cause.  The artifact
+                           ;; component keeps the failed request for a retry
+                           ;; and exposes the diagnostic in its snapshot; the
+                           ;; same event is broadcast so the operator sees
+                           ;; that an artifact was not registered.
+                           (let [diagnostic (or (:artifact-diagnostic
+                                                 (ex-data t))
+                                                (artifacts-integration/registration-diagnostic
+                                                 {:session-id (:session-id terminal)
+                                                  :task-id (:task-id terminal)
+                                                  :call-id (:tool-call-id terminal)
+                                                  :executor (:name terminal)
+                                                  :result (:result terminal)
+                                                  :workspace-root (:workspace-root config)}
+                                                 t))]
+                             (when-let [gw (:gateway @system-ref)]
+                               (try
+                                 (gateway/broadcast!
+                                  gw
+                                  {:type "CUSTOM"
+                                   :name "hc/artifact-undelivered"
+                                   :value (assoc diagnostic
+                                                 :thread-id session-id
+                                                 :session-id session-id)})
+                                 (catch Throwable _ nil)))))))
                     :mission-port mission-port
                     :tool-result-renderer
                     program/render-tool-result
@@ -3342,8 +3378,15 @@
        {:documents {:ocr (try (documents/ocr-status)
                               (catch Throwable _ nil))}})
      (when (and artifacts active-session)
-       (try {:artifacts (:artifacts ((:snapshot artifacts) active-session))}
-            (catch Throwable _ {:artifacts []})))
+       (try
+         (let [snap ((:snapshot artifacts) active-session)]
+           {:artifacts (:artifacts snap)
+            ;; A file the executor wrote but registration refused is a
+            ;; visible state, not a log line: the operator can see the
+            ;; undelivered artifact next to the ones that succeeded.
+            :artifact-registration-failures
+            (:pending-registrations snap)})
+         (catch Throwable _ {:artifacts []})))
      (when fleet
        (try (fleet/snapshot-tables fleet)
             (catch Throwable _ {:fleet/error true})))

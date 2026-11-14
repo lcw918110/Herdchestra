@@ -59,7 +59,9 @@
                                         :create? true})
          ~blob-sym (str ~dir-sym "/blobs")
          ~svc-sym (artifacts/service {:store ~store-sym
-                                      :blob-root ~blob-sym})]
+                                      :blob-root ~blob-sym
+                                      :workspace-root ~dir-sym
+                                      :capture-root (str ~dir-sym "/captures")})]
      (try
        ~@body
        (finally
@@ -503,7 +505,8 @@
   (with-artifact-env [store blob-root _svc dir]
     (let [app (integration/attach {:store store
                                    :blob-root blob-root
-                                   :config {:limits {:artifact-bytes (* 1024 1024)}}})
+                                   :config {:workspace-root dir
+                                            :limits {:artifact-bytes (* 1024 1024)}}})
           file (write-file! dir "delivered.log" "line\n")
           result ((:register! app) {:session-id "s1"
                                     :file file
@@ -568,7 +571,7 @@
     (let [file (write-file! dir "out.log" "line one\nline two\n")
           component (integration/attach {:store store
                                          :blob-root blob-root
-                                         :config {}})
+                                         :config {:workspace-root dir}})
           published (atom [])
           result (integration/register-executor-result!
                   component
@@ -612,3 +615,172 @@
                  svc {:session-id "s1" :file file
                       :name "produced.txt"
                       :producer {:kind :tool :name "shell"}}))))))))
+
+(defn- symlink!
+  "Create a symbolic link at LINK pointing at TARGET."
+  [link target]
+  (Files/createSymbolicLink (Paths/get link (make-array String 0))
+                            (Paths/get target (make-array String 0))
+                            (make-array FileAttribute 0))
+  link)
+
+(deftest source-symlink-escape-is-refused
+  (with-artifact-env [store blob-root svc dir]
+    (let [workspace (str dir "/workspace")
+          outside (str dir "/outside")
+          _ (io/make-parents (str workspace "/.keep"))
+          _ (io/make-parents (str outside "/.keep"))
+          secret (write-file! outside "secret.txt" "not task output\n")
+          link (symlink! (str workspace "/innocent.txt") secret)]
+      (testing "a link inside the workspace that resolves outside is refused"
+        (is (= :ARTIFACT_OUTSIDE_WORKSPACE
+               (error-code
+                (fn []
+                  (artifacts/register! svc {:session-id "s1"
+                                            :file link
+                                            :follow-links? true
+                                            :name "innocent.txt"
+                                            :workspace-root workspace
+                                            :relative-path "innocent.txt"}))))
+            "containment is judged on the real path, not the declared one"))
+      (testing "the rejection names the real path for audit"
+        (let [e (try (artifacts/register! svc {:session-id "s1"
+                                               :file link
+                                               :follow-links? true
+                                               :name "innocent.txt"
+                                               :workspace-root workspace
+                                               :relative-path "innocent.txt"})
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))
+              data (ex-data e)]
+          (is (= :ARTIFACT_OUTSIDE_WORKSPACE (:error data)))
+          (is (str/ends-with? (:real-path data) "secret.txt"))
+          (is (= (str (check/real-path workspace)) (:workspace-root data)))))
+      (testing "an honest in-workspace file still registers"
+        (let [inside (write-file! workspace "report.txt" "inside\n")
+              result (artifacts/register!
+                      svc {:session-id "s1"
+                           :file inside
+                           :name "report.txt"
+                           :source-task-id "t1"
+                           :workspace-root workspace
+                           :relative-path "report.txt"})]
+          (is (:ok? result))
+          (is (true? (:workspace-verified? (:artifact result))))
+          (is (= "report.txt" (get-in result [:artifact :origin
+                                              :verified-relative-path])))))
+      (testing "relative-path must agree with the real location"
+        (let [inside (write-file! workspace "nested.txt" "nested\n")]
+          (is (= :ARTIFACT_RELATIVE_PATH_MISMATCH
+                 (error-code
+                  (fn []
+                    (artifacts/register!
+                     svc {:session-id "s1"
+                          :file inside
+                          :name "nested.txt"
+                          :workspace-root workspace
+                          :relative-path "../nested.txt"})))))))
+      (testing "an explicit operator export is allowed but recorded"
+        (let [result (artifacts/register!
+                      svc {:session-id "s1"
+                           :file secret
+                           :name "secret.txt"
+                           :allow-outside-workspace? true
+                           :workspace-root workspace})]
+          (is (:ok? result))
+          (is (true? (:outside-workspace? (:artifact result)))))))))
+
+(deftest announcement-nil-is-not-success
+  (with-artifact-env [store blob-root _svc dir]
+    (let [component (integration/attach {:store store
+                                         :blob-root blob-root
+                                         :config {:workspace-root dir}})
+          file (write-file! dir "out.log" "line one\n")
+          error (try
+                  (integration/register-executor-result!
+                   component
+                   {:session-id "s1"
+                    :task-id "t1"
+                    :call-id "c1"
+                    :executor :shell
+                    :result {:output {:artifact {:path file}}}
+                    :publish! (fn [_] nil)})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? error) "a nil publish result must not pass as accepted")
+      (is (= :ARTIFACT_ANNOUNCEMENT_FAILED (:code (ex-data error))))
+      (let [artifact ((:list component) {:session-id "s1"})
+            stored (first (:artifacts artifact))]
+        (is (false? (:announced? stored))
+            "an unaccepted announcement must keep the artifact unannounced"))
+      (testing "the diagnostic is retriable and reachable"
+        (is (str/ends-with? (get-in (first ((:pending component)))
+                                    [:artifact-diagnostic :path])
+                            "out.log")))
+      (testing "a later real publish marks it announced"
+        (let [published (atom [])
+              retried ((:retry-pending! component)
+                       (fn [event] (swap! published conj event) {:ok? true}))]
+          (is (= 1 (:retried retried)))
+          (is (= 1 (count (:succeeded retried))))
+          (is (true? (:announced? (first (:artifacts
+                                          ((:list component)
+                                           {:session-id "s1"})))))))
+      (testing "no publisher is reported as not configured, not as success"
+        (let [other (write-file! dir "other.log" "other\n")
+              result (integration/register-executor-result!
+                      component
+                      {:session-id "s2"
+                       :task-id "t2"
+                       :call-id "c2"
+                       :executor :shell
+                       :result {:output {:artifact {:path other}}}})]
+          (is (:ok? result))
+          (is (false? (:announced? result))
+              "without a publisher the artifact must stay unannounced")
+          (is (= :not-configured (:announcement-status result)))
+          (is (false? (:announced? (first (:artifacts
+                                           ((:list component)
+                                           {:session-id "s2"}))))))))))))
+
+(deftest registration-failure-is-diagnosed-and-retriable
+  (with-artifact-env [store blob-root _svc dir]
+    (let [component (integration/attach {:store store
+                                         :blob-root blob-root
+                                         :config {:workspace-root dir}})
+          file (write-file! dir "captured.log" "captured\n")
+          error (with-redefs [storage/commit-migration!
+                              (fn [& _]
+                                (throw (ex-info "lower storage failure"
+                                                {:error :STORAGE_TX_FAILED
+                                                 :storage/expected? true})))]
+                  (try
+                    (integration/register-executor-result!
+                     component
+                     {:session-id "s1"
+                      :task-id "t1"
+                      :call-id "call-42"
+                      :executor :shell
+                      :result {:output {:artifact {:path file}}}
+                      :publish! (fn [_] true)})
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e)))
+          diagnostic (get (ex-data error) :artifact-diagnostic)]
+      (is (some? error) "registration failure must not be swallowed")
+      (is (= :STORAGE_TX_FAILED (:code diagnostic)))
+      (is (= "call-42" (:tool-call-id diagnostic)))
+      (is (str/ends-with? (:path diagnostic) "captured.log"))
+      (is (= "lower storage failure" (:message diagnostic)))
+      (testing "the diagnostic is queryable from the component"
+        (is (= diagnostic ((:last-error component))))
+        (is (= [diagnostic]
+               (get-in ((:snapshot component) "s1")
+                       [:pending-registrations]))))
+      (testing "a retry after the store recovers registers the artifact"
+        (let [result ((:retry-pending! component) (fn [_] true))]
+          (is (= 1 (:retried result)))
+          (is (= 1 (count (:succeeded result))))
+          (is (empty? (:failed result)))
+          (is (empty? ((:pending component))))
+          (is (= 1 (count (:artifacts ((:list component)
+                                       {:session-id "s1"}))))))))))

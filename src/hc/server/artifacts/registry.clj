@@ -186,10 +186,11 @@
      :max-bytes (or (:max-bytes request) (:max-bytes (:opts service)))
      :text-check-bytes (or (:text-check-bytes request)
                            (:text-check-bytes (:opts service)))
-     :follow-links? (if (contains? request :follow-links?)
-                      (:follow-links? request)
-                      (:follow-links? (:opts service)))
-     :notes (:notes request)}))
+    :follow-links? (if (contains? request :follow-links?)
+                     (:follow-links? request)
+                     (:follow-links? (:opts service)))
+    :allow-outside-workspace? (true? (:allow-outside-workspace? request))
+    :notes (:notes request)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Public projections
@@ -424,10 +425,18 @@
     source (assoc :source-path (str (:path source))
                   :source-stamp (:stamp source)
                   :source-modified-at (:modified-at source)
+                  :workspace-verified? (boolean (:workspace-verified? source))
+                  :capture-root? (boolean (:capture-root? source))
+                  :outside-workspace? (boolean (:outside-workspace? source))
                   :origin {:workspace-root (:workspace-root request)
+                           :real-workspace-root (:workspace-root source)
                            :path (str (:path source))
                            :real-path (str (:real-path source))
                            :relative-path (:relative-path request)
+                           :verified-relative-path (:relative-path source)
+                           :workspace-verified? (boolean (:workspace-verified? source))
+                           :capture-root? (boolean (:capture-root? source))
+                           :outside-workspace? (boolean (:outside-workspace? source))
                            :stamp (:stamp source)
                            :modified-at (:modified-at source)})))
 
@@ -524,6 +533,104 @@
                (assoc (dissoc error :code :message)
                       :checks [check]))))
 
+(defn- effective-workspace-root
+  "The task workspace that must contain a file source.
+
+  A request may name its own workspace; otherwise the service-level root
+  applies."
+  [service request]
+  (or (:workspace-root request)
+      (get-in service [:opts :workspace-root])))
+
+(defn- inside?
+  "True when PATH is a strict descendant of ROOT's real path.
+
+  A nil or unresolvable root is never containment."
+  [path root]
+  (let [real (when (some? root) (check/real-path root))]
+    (and (some? real)
+         (some? path)
+         (not= real path)
+         (.startsWith ^java.nio.file.Path path ^java.nio.file.Path real))))
+
+(defn- workspace-provenance
+  "Prove where a file source came from, or refuse it.
+
+  Containment is decided on real paths, so a symlink inside a root that
+  resolves outside it is refused; the declared spelling never decides.
+
+  A request that names a `:workspace-root` is judged against exactly that
+  root: it must be a strict real-path descendant, and a declared
+  `:relative-path` must equal the real relative position (which closes `../`
+  escapes).  Application-managed roots (`:capture-root` for Shell output
+  captures, `:managed-roots` for worktrees) are consulted only when the
+  request names no workspace, because those directories are where the
+  application itself writes bytes on the caller's behalf.
+
+  `:allow-outside-workspace? true` is the explicit operator-export escape
+  hatch: it accepts any resolvable source and records
+  `:outside-workspace? true` so the deviation stays auditable.
+
+  Everything else is refused: a registration that cannot name the workspace
+  it came from is exactly the hole this check closes."
+  [service request source]
+  (let [declared-root (:workspace-root request)
+        root (effective-workspace-root service request)
+        managed-roots (->> (concat [(:capture-root (:opts service))]
+                                   (:managed-roots (:opts service)))
+                           (remove nil?))
+        relative-path (:relative-path request)
+        real (:real-path source)
+        bypass? (true? (:allow-outside-workspace? request))
+        workspace-real (some-> root check/real-path)]
+    (cond
+      (and (some? real) (inside? real root))
+      (let [boundary (check/workspace-boundary (:path source) root
+                                               relative-path)]
+        (if (:ok? boundary)
+          {:workspace-root (str (:workspace-real boundary))
+           :relative-path (:relative-path boundary)
+           :workspace-verified? true
+           :capture-root? false
+           :outside-workspace? false}
+          (let [error (:error boundary)]
+            (err/fail! (:code error)
+                       (:message error)
+                       (assoc (dissoc error :code :message)
+                              :checks [{:check :workspace-boundary
+                                        :ok? false}])))))
+
+      bypass?
+      {:workspace-root (some-> workspace-real str)
+       :workspace-verified? false
+       :capture-root? false
+       :outside-workspace? true}
+
+      (and (nil? declared-root)
+           (some #(inside? real %) managed-roots))
+      {:workspace-root (some-> workspace-real str)
+       :workspace-verified? false
+       :capture-root? true
+       :outside-workspace? false}
+
+      (or (some? workspace-real)
+          (and (nil? declared-root) (seq managed-roots)))
+      (err/fail! :ARTIFACT_OUTSIDE_WORKSPACE
+                 "artifact source is outside its task workspace"
+                 {:workspace-root (some-> workspace-real str)
+                  :file (str (:path source))
+                  :real-path (str real)
+                  :checks [{:check :workspace-boundary :ok? false}]})
+
+      :else
+      (err/fail! :ARTIFACT_WORKSPACE_REQUIRED
+                 "artifact registration needs a :workspace-root to prove the source came from the task workspace"
+                 {:path (str (:path source))
+                  :relative-path relative-path
+                  :checks [{:check :workspace-boundary
+                            :ok? false
+                            :reason :workspace-required}]}))))
+
 (defn- check-source!
   [service request]
   (let [source (or (:source request)
@@ -532,7 +639,14 @@
                     {:follow-links? (:follow-links? request)}))]
     (when-not (:ok? source)
       (source-failure source))
-    (let [size (long (get-in source [:stamp :size]))
+    (let [provenance (if (:file request)
+                       (workspace-provenance service request source)
+                       ;; A managed content ID is already inside the blob
+                       ;; store; there is no workspace path to prove.
+                       {:workspace-verified? false
+                        :capture-root? false
+                        :outside-workspace? false})
+          size (long (get-in source [:stamp :size]))
           max-bytes (long (:max-bytes request))]
       (when (and (zero? size) (not (:allow-empty? request)))
         (err/fail! :ARTIFACT_EMPTY
@@ -553,7 +667,11 @@
                     :declared (:size request)
                     :actual size}))
       (ensure-session-capacity! service request size)
-      source)))
+      (merge source
+             (select-keys provenance
+                          [:workspace-root :relative-path
+                           :workspace-verified? :capture-root?
+                           :outside-workspace?])))))
 
 (defn- same-registration?
   "True when an existing artifact is the same submission, not a new one that

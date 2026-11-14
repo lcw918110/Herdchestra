@@ -231,6 +231,82 @@
        :modified-at (str (.toInstant (.lastModifiedTime a)))
        :attrs a})))
 
+(defn- non-empty-string?
+  [x]
+  (and (string? x) (not (str/blank? x))))
+
+(defn- normalize-relative
+  "Normalize a declared relative path to the platform's separator form."
+  [value]
+  (-> (Paths/get (str value) (make-array String 0))
+      (.normalize)
+      (str)))
+
+(defn real-path
+  "Resolve `value` to its real, symlink-free absolute Path, or nil.
+
+  Containment must be judged on this path: a textual prefix test on the
+  declared path lets a symlink deliver bytes from outside the workspace."
+  ^Path [value]
+  (try
+    (.toRealPath (path-of value) no-link-options)
+    (catch java.io.IOException _ nil)
+    (catch java.nio.file.InvalidPathException _ nil)))
+
+(defn workspace-boundary
+  "Prove that a source's real path lies inside its task workspace.
+
+  Returns `{:ok? true :workspace-real :source-real :relative-path}` or a
+  rejection map with `:error`.  The comparison uses real paths, so a symlink
+  whose declared path looks nested but resolves outside the workspace is
+  refused.  A declared `:relative-path` must equal the real relative path,
+  which also closes `../` escapes."
+  [file workspace-root relative-path]
+  (let [workspace-real (when (non-empty-string? workspace-root)
+                         (real-path workspace-root))
+        source-real (real-path file)]
+    (cond
+      (nil? workspace-real)
+      {:ok? false
+       :error {:code :ARTIFACT_WORKSPACE_UNAVAILABLE
+               :message "the task workspace cannot be resolved to a real path"
+               :workspace-root (str workspace-root)
+               :file (str file)
+               :real-path (some-> source-real str)}}
+
+      (nil? source-real)
+      {:ok? false
+       :error {:code :ARTIFACT_SOURCE_MISSING
+               :message "artifact source has no real path"
+               :workspace-root (str workspace-real)
+               :file (str file)}}
+
+      (not (.startsWith ^Path source-real ^Path workspace-real))
+      {:ok? false
+       :error {:code :ARTIFACT_OUTSIDE_WORKSPACE
+               :message "artifact source is outside its task workspace"
+               :workspace-root (str workspace-real)
+               :file (str file)
+               :real-path (str source-real)}}
+
+      :else
+      (let [actual (str (.relativize ^Path workspace-real ^Path source-real))
+            declared (some-> relative-path str)]
+        (if (and (non-empty-string? declared)
+                 (not= (normalize-relative declared) actual))
+          {:ok? false
+           :error {:code :ARTIFACT_RELATIVE_PATH_MISMATCH
+                   :message "declared :relative-path does not match the real source location"
+                   :workspace-root (str workspace-real)
+                   :file (str file)
+                   :real-path (str source-real)
+                   :relative-path declared
+                   :actual-relative-path actual}}
+          {:ok? true
+           :workspace-real workspace-real
+           :source-real source-real
+           :relative-path actual})))))
+
 (defn source-stable?
   "Compare a fresh observation with the snapshot taken before copying."
   [snapshot]
