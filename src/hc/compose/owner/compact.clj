@@ -187,37 +187,46 @@
   current-state document."
   ([state store] (compact-state state store nil))
   ([state store measured-before]
-  (if-not (and store (:put! store))
-    [state {:before (or measured-before (count (pr-str state)))
-            :after (count (pr-str state))
-            :saved 0
-            :refs 0
-            :skipped? true}]
-    (let [before (or measured-before (count (pr-str state)))
-          state' (-> state
-                     (update :calls
-                             (fn [calls]
-                               (into {} (map (fn [[k v]] [k (compact-call store v)])
-                                             calls))))
-                     (update :cancel
-                             (fn [cancel]
-                               (if (map? cancel)
-                                 (update cancel :nodes
-                                         (fn [nodes]
-                                           (into {} (map (fn [[k v]]
-                                                           [k (compact-value store v)])
-                                                         nodes))))
-                                 cancel)))
-                     (update :runs
-                             (fn [runs]
-                               (into {} (map (fn [[k v]]
-                                               [k (compact-value store v)])
-                                             runs)))))
-          after (count (pr-str state'))]
-      [state' {:before before
-               :after after
-               :saved (max 0 (- before after))
-               :refs (if-let [c (:count store)] (c) 0)}]))))
+   (compact-state state store measured-before {}))
+  ([state store measured-before {:keys [measure?] :or {measure? true}}]
+   (if-not (and store (:put! store))
+     [state {:before (or measured-before 0)
+             :after (or measured-before 0)
+             :saved 0
+             :refs 0
+             :skipped? true}]
+     (let [before (when measure?
+                    (or measured-before (count (pr-str state))))
+           state' (-> state
+                      (update :calls
+                              (fn [calls]
+                                (into {} (map (fn [[k v]] [k (compact-call store v)])
+                                              calls))))
+                      (update :cancel
+                              (fn [cancel]
+                                (if (map? cancel)
+                                  (update cancel :nodes
+                                          (fn [nodes]
+                                            (into {} (map (fn [[k v]]
+                                                            [k (compact-value store v)])
+                                                          nodes))))
+                                  cancel)))
+                      (update :runs
+                              (fn [runs]
+                                (into {} (map (fn [[k v]]
+                                                [k (compact-value store v)])
+                                              runs)))))]
+       ;; Sizing the document costs two full `pr-str` passes, which is the
+       ;; single most expensive thing this function can do.  The commit path
+       ;; only needs the compacted state, not its measured size, so it opts
+       ;; out and pays nothing for statistics it never reads.
+       (if measure?
+         (let [after (count (pr-str state'))]
+           [state' {:before before
+                    :after after
+                    :saved (max 0 (- before after))
+                    :refs (if-let [c (:count store)] (c) 0)}])
+         [state' {:refs (if-let [c (:count store)] (c) 0)}])))))
 
 (defn- source-reference?
   [value]

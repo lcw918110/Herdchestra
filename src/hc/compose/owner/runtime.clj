@@ -393,7 +393,7 @@
   [runtime state]
   (let [store (get-in runtime [:config :blob-store])]
     (if (and store (:put! store))
-      (first (compact/compact-state state store))
+      (first (compact/compact-state state store nil {:measure? false}))
       state)))
 
 (defn- commit-message!
@@ -1041,7 +1041,9 @@
         store (if-let [blob-store (:blob-store opts)]
                 (store/compacting-store
                  raw-store
-                 (fn [state] (compact/compact-state state blob-store)))
+                 (fn [state]
+                   (compact/compact-state state blob-store nil
+                                          {:measure? false})))
                 raw-store)
         opts (assoc opts :store store)
         registry (or (:registry opts) (commands/local-registry))
