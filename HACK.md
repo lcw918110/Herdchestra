@@ -1814,6 +1814,12 @@ HC_E2E_KEEP_TEMP=1 JAVA_HOME=$PWD/.pixi/envs/default/lib/jvm \
 - **复检**：`grep -n "sourceTreeSha256" test/e2e/*.spec.mjs` 应只看到导入/
   使用，不应看到本地 walk 实现；比较不同 spec 的哈希前先确认口径。
 - **适用范围**：所有 E2E 证据与门禁跨 spec 哈希比较。
+- **修复（2026-11-14）**：`e2e-11.spec.mjs` 与 `e2e-21.spec.mjs` 曾把
+  `sha256(git HEAD tree + spec bytes)` 直接写进 `sourceTreeSha256` 字段；
+  e2e-11 还把标准值挤到 `treeSha256Dual`，e2e-21 则完全没记标准值。字段名
+  占着跨 spec 比较键，却在回答另一个问题，比较必然误报。两处现在都改成
+  `treeSha256: sourceTreeSha256()` 加独立命名的 `specCompositeSha256`。
+  复检：`grep -rn "treeSha256Dual" test/` 应为空。
 
 ## 18 E2E 06 的 fixture 依赖 Pillow 与跨平台字体（2026-11-11）
 

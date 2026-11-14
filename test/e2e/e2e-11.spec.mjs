@@ -591,7 +591,12 @@ test('@e2e E2E 11 memory candidates, archive and temporary sessions', async ({ p
     appUrl: app.url, mockUrl: mock.url,
     chromeVersion: browser.version(),
     clientBundle: clientBundleInfo(),
-    sourceTreeSha256: (() => {
+    // `sourceTreeSha256` is a cross-spec comparison key: two specs that
+    // disagree about the formula produce a false "the tree drifted" report.
+    // The spec also pins its own bytes, but that composite answers a
+    // different question, so it gets its own name.
+    treeSha256: sourceTreeSha256(),
+    specCompositeSha256: (() => {
       try {
         const tree = execSync('git rev-parse HEAD^{tree}', { cwd: REPO_ROOT })
           .toString().trim();
@@ -601,7 +606,6 @@ test('@e2e E2E 11 memory candidates, archive and temporary sessions', async ({ p
           .digest('hex');
       } catch { return null; }
     })(),
-    treeSha256Dual: sourceTreeSha256(),
     checks: {}, screenshots: [],
   };
   const save = (name) => writeJson(EVIDENCE, name, result);

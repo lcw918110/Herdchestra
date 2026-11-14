@@ -33,14 +33,6 @@
 - **建议**：在 `sessions` 分区维护与索引更新同事务的 committed session count，健康端点读取该计数；若继续接受 O(N)，在 `HACK.md` 记录预算、测量口径与超过阈值时的降级为 `:unknown`。
 - **证据**：`src/hc/server/app/system.clj:5566-5580,5789-5801`；`src/hc/server/app/session_persistence.clj:443-445` 返回完整 `:ids`；已有测量为 1000 会话约 1.6 ms。
 
-## D-46 E2E 21 的证据哈希口径与标准公式不可直接比较
-
-- **条款**：E2E 证据必须使用统一、可比较的 `sourceTreeSha256` 口径。
-- **缺口/现象**：E2E 21 使用自定义 `sha256(git HEAD tree + spec bytes)` 证据哈希，不等同于标准 `find src test` 公式。E2E 17 曾自带只 walk `src` + `test/e2e` 的私有实现（记录 `74c18e18…`），已在测试侧加固时移除；E2E 11/17 现在使用标准树。
-- **影响**：跨 spec/门禁比较源树哈希会误报；E2E 21 的哈希不能直接与标准 tree 哈希对齐。
-- **建议**：所有 spec 必须从 `test/e2e/support/evidence.mjs` 导入 `sourceTreeSha256`，禁止本地重写；确需自定义口径时必须在证据中显式标记，并在门禁比较时排除。
-- **状态**：已知限制，不视为失败；已在 `HACK.md` §17.29 记录。
-
 ## D-47 devops worker 内部的 shell 动作不进 Owner 调用账本
 
 - **条款**：`AGENTS.md` §5.3（未结责任与 `:outcome-unknown` 恢复窗口）、§4.4（`.call` 会话边界）。

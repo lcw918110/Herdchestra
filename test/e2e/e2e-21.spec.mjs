@@ -26,6 +26,7 @@ import {
   newSession, selectFirstSession, shot, turnLive, userTexts, waitForAssistant, waitForShell, waitForSync,
   writeJson, clientBundleInfo,
 } from './support/ui.mjs';
+import { sourceTreeSha256 } from './support/evidence.mjs';
 
 const EVIDENCE = path.join(REPO_ROOT, 'plans/evidence/e2e-21');
 
@@ -386,7 +387,11 @@ test('@core E2E 21 cost accounting口径', async ({ page, browser }) => {
     appUrl: app.url, mockUrl: mock.url, searchUrl: search.url,
     chromeVersion: browser.version(),
     clientBundle: clientBundleInfo(),
-    sourceTreeSha256: (() => {
+    // The shared formula keeps evidence comparable across specs.  The spec
+    // also pins its own bytes, but that answers a different question and is
+    // recorded under its own name.
+    treeSha256: sourceTreeSha256(),
+    specCompositeSha256: (() => {
       try {
         const tree = execSync('git rev-parse HEAD^{tree}', { cwd: REPO_ROOT }).toString().trim();
         const spec = fs.readFileSync(new URL(import.meta.url));
