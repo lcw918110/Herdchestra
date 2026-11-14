@@ -1026,12 +1026,23 @@
   [opts]
   (let [opts (update opts :owner-instance-id
                      #(or % (str (random-uuid))))
-        store (or (:store opts)
-                  (when (:ephemeral? opts)
-                    (store/memory-store)))
-        _ (when-not store
+        raw-store (or (:store opts)
+                      (when (:ephemeral? opts)
+                        (store/memory-store)))
+        _ (when-not raw-store
             (throw (ex-info "start-owner! needs a :store or :ephemeral? true"
                             {:code :STORE_REQUIRED})))
+        ;; Wrap the store once so every commit path is bounded, not just the
+        ;; message path.  A guard transition that reaches `:awaiting-commit`
+        ;; commits its candidate state directly, and that state may carry a
+        ;; freshly settled call whose request snapshot is still inline.
+        ;; `compact-state` is idempotent, so the fold costs one pass over
+        ;; the call map and never rewrites what is already referenced.
+        store (if-let [blob-store (:blob-store opts)]
+                (store/compacting-store
+                 raw-store
+                 (fn [state] (compact/compact-state state blob-store)))
+                raw-store)
         opts (assoc opts :store store)
         registry (or (:registry opts) (commands/local-registry))
         stored (store/load-state store)
