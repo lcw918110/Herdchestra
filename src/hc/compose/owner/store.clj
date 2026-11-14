@@ -100,5 +100,51 @@
      (throw (ex-info "an initial state needs a non-zero initial version"
                      {:code :INVALID_VERSION
                       :initial-version initial-version})))
-   (->MemoryStore (atom {:version initial-version :state initial-state})
-                  (atom false))))
+  (->MemoryStore (atom {:version initial-version :state initial-state})
+                 (atom false))))
+
+(defrecord CompactingStore [inner compact-fn stats]
+  Store
+  (load-state [_]
+    (load-state inner))
+
+  (commit! [_ expected-version new-state]
+    ;; Compaction runs on the commit path because that is the only place
+    ;; the whole document is already materialized.  It rewrites large
+    ;; terminal-call content to content-addressed references, so the bytes
+    ;; reaching storage are bounded by the number of live records rather
+    ;; than by how much the session has produced.
+    (let [[compacted result] (compact-fn new-state)]
+      (when (and (map? result) (pos? (long (or (:saved result) 0))))
+        (swap! stats (fn [s]
+                       (-> s
+                           (update :commits (fnil inc 0))
+                           (update :saved (fnil + 0) (long (:saved result)))
+                           (update :refs (fnil max 0)
+                                   (long (or (:refs result) 0)))))))
+      (commit! inner expected-version compacted)))
+
+  (close! [_]
+    (close! inner)))
+
+(defn compacting-store
+  "Wrap STORE so every commit first shrinks large terminal-call content.
+
+  COMPACT-FN is `(fn [state] [state' stats])`, normally
+  `hc.compose.owner.compact/compact-state` partially applied to a blob
+  store.  The decorator is optional and removable: a plain store keeps the
+  same compare-and-set contract, it just stores a larger document.
+
+  `stats` accumulates `{:commits :saved :refs}` so the operator can see how
+  much the session has folded and how many distinct blobs it references."
+  ([store compact-fn] (compacting-store store compact-fn (atom {})))
+  ([store compact-fn stats]
+   (when-not (ifn? compact-fn)
+     (throw (ex-info "compacting-store needs a compact-fn"
+                     {:code :INVALID_COMPACT_FN})))
+   (->CompactingStore store compact-fn stats)))
+
+(defn compaction-stats
+  [store]
+  (when (instance? CompactingStore store)
+    @(:stats store)))

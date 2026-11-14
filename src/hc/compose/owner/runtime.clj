@@ -97,7 +97,10 @@
      :nudge-suppress (:nudge-suppress (:config runtime))
      :worker-run-program-fn (:worker-run-program-fn (:config runtime))
      :blob-store (:blob-store (:config runtime))
-     :compact-threshold (:compact-threshold (:config runtime))
+     ;; The uncommitted streaming tails.  Handlers own it; guards must not
+     ;; read it, because a guard decision may not depend on text that has
+     ;; not been committed.
+     :stream-buffer (:stream-buffer runtime)
      :retry-policy (:retry-policy state)
      :max-tool-concurrency (get-in state [:config :max-tool-concurrency] 1)}))
 
@@ -367,15 +370,29 @@
                                    (.getMessage error))}}))))))
 
 (defn- compact-state-for-commit
-  "Compact large call/cancel content before a commit when the state is over
-  the configured threshold.  A missing blob store leaves the state as-is."
+  "Reference large settled-call content before every commit.
+
+  This used to be a threshold switch: serialize the whole state, compare
+  the character count against `:compact-threshold`, and compact only above
+  it.  That measurement is itself a full `pr-str` of the document, so the
+  switch paid half the cost it was trying to save on every commit, and the
+  document still sawtoothed: a session compacted once at 1 MB, then grew
+  straight back through the same range, one full serialization per commit
+  for the next 45 turns.
+
+  `compact-state` is idempotent — a call that already carries
+  `:request-ref` is returned unchanged — so running it on every commit
+  costs one pass over the call map and saves the duplicate snapshot bytes
+  from the moment the call settles.  A settled call's request snapshot is
+  pure bulk: nothing reads `[:request :snapshot :messages]` after the
+  terminal.  On a 100-turn session with a 32-message 300-char window the
+  document went from 1,817,818 to 247,428 chars.
+
+  A missing blob store, or a state that references nothing large, leaves
+  the state as-is.  The decorator-less production path is unaffected."
   [runtime state]
-  (let [store (get-in runtime [:config :blob-store])
-        threshold (long (or (get-in runtime [:config :compact-threshold])
-                            1000000))]
-    (if (and store
-             (:put! store)
-             (> (count (pr-str state)) threshold))
+  (let [store (get-in runtime [:config :blob-store])]
+    (if (and store (:put! store))
       (first (compact/compact-state state store))
       state)))
 
@@ -1109,6 +1126,16 @@
                             (daemon-thread-factory
                              (str "hc-owner-notify-" (:session-id opts))))
                  :state (atom loaded)
+                 ;; Uncommitted streaming tails, keyed by run id.  A chunk
+                 ;; that only appends text must not force a full-document
+                 ;; commit, so the tail waits here on the Owner thread and
+                 ;; is folded into the run when the Owner finalizes it —
+                 ;; including on cancellation, which is why the buffer lives
+                 ;; on the Owner's side rather than the sender's.
+                 ;;
+                 ;; Only the mailbox thread touches this atom.  It never
+                 ;; enters the committed document and dies with the runtime.
+                 :stream-buffer (atom {})
                  :scheduler (atom (scheduler/new-scheduler
                                    {:quota (or (:quota opts) default-quota)
                                     :attempt-prefix
