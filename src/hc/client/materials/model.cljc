@@ -865,6 +865,37 @@
   (or (:selected-session-id state)
       (get-in state [:session :session-id])))
 
+(defn panel-session
+  "Whose materials this panel is serving, and whether the tables back it.
+
+  D-53: the badge said \"materials ready\" without naming a session, so a
+  dropped cross-session snapshot left the operator reading another session's
+  tables with no way to notice.
+
+  `:session-id` is the client selection — the session the next materials
+  command will carry, and therefore who this panel serves.
+  `:loaded-session-id` is the session the accepted snapshot actually
+  described.  `:ready?` plus equality answers the honest question: tables
+  for the served session are loaded.  `:rejected-reason` names the newest
+  dropped snapshot (`:cross-session` / `:stale`), which is what explains a
+  panel that is not ready while its selection looks unchanged."
+  [state]
+  (let [rejected (:last-rejected state)
+        selected (or (:selected-session-id state)
+                     (get-in state [:session :session-id]))
+        loaded (get-in state [:session :session-id])]
+    {:session-id selected
+     :title (get-in state [:session :title])
+     :loaded-session-id loaded
+     ;; Tables were accepted for the served session only when both ids agree
+     ;; and the projection is ready.  Anything else is either still loading
+     ;; or another session's data; the view says which.
+     :serves-loaded? (boolean (and (:ready? state)
+                                   (some? selected)
+                                   (= selected loaded)))
+     :rejected-reason (:reason rejected)
+     :rejected-session-id (:snapshot-session-id rejected)}))
+
 (defn begin-session
   "Drop server-derived materials state before loading a different session.
 

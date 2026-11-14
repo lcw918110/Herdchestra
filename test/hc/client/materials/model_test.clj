@@ -211,6 +211,35 @@
     (is (= :stale (get-in next [:last-rejected :reason]))
         "an older revision is kept out, and says so")))
 
+(deftest panel-session-names-who-the-panel-serves
+  (testing "a loaded panel serves its own session"
+    (let [state (model/apply-snapshot (synced-state) snapshot)
+          panel (model/panel-session state)]
+      (is (= "s-1" (:session-id panel)))
+      (is (= "s-1" (:loaded-session-id panel)))
+      (is (true? (:serves-loaded? panel)))
+      (is (nil? (:rejected-reason panel)))))
+  (testing "a session switch is not this session's data yet"
+    (let [state (-> (model/apply-snapshot (synced-state) snapshot)
+                    (model/begin-session "s-2"))
+          panel (model/panel-session state)]
+      (is (= "s-2" (:session-id panel)) "the panel serves the selection")
+      (is (not (:serves-loaded? panel)))
+      (is (false? (:ready? state)))))
+  (testing "a dropped cross-session snapshot names both sides"
+    (let [state (-> (model/apply-snapshot (synced-state) snapshot)
+                    (model/begin-session "s-2")
+                    (model/apply-snapshot snapshot))
+          panel (model/panel-session state)]
+      (is (= "s-2" (:session-id panel)))
+      (is (= :cross-session (:rejected-reason panel)))
+      (is (= "s-1" (:rejected-session-id panel)))
+      (is (not (:serves-loaded? panel)))))
+  (testing "no session at all is reported as unknown, not as ready"
+    (let [panel (model/panel-session (model/initial-state))]
+      (is (nil? (:session-id panel)))
+      (is (not (:serves-loaded? panel))))))
+
 (deftest commands-target-selected-session
   (let [state (-> (model/apply-snapshot (synced-state) snapshot)
                   (model/begin-session "s-2"))

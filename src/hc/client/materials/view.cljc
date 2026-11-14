@@ -60,6 +60,35 @@
   (el :span {:class "hc-mat-badge" :data-tone (name (or tone :neutral))}
       label))
 
+(def ^:private rejected-reason-labels
+  {:cross-session "最新快照属于另一个会话"
+   :stale "最新快照早于当前 revision"})
+
+(defn- session-badge
+  "Name the session this panel serves, and whether its tables back it.
+
+  D-53: a dropped snapshot is silent by design (`apply-snapshot` must not
+  overwrite another session's tables), so the panel has to say both things.
+  A ready library for the served session is `:ok`; a ready-looking library
+  that is not this session's is `:warn`; nothing loaded yet is neutral."
+  [state]
+  (let [{:keys [session-id title serves-loaded? rejected-reason]}
+        (model/panel-session state)
+        whose (or title session-id)]
+    (cond
+      (nil? session-id)
+      (badge "会话未确定" :warn)
+
+      serves-loaded?
+      (badge (str "会话 " whose) :ok)
+
+      :else
+      (let [reason (get rejected-reason-labels rejected-reason)
+            label (cond
+                    reason (str "会话 " whose " · " reason)
+                    :else (str "会话 " whose " · 材料尚未载入"))]
+        (badge label :warn)))))
+
 (defn- field
   [label control & [hint]]
   (el :label {:class "hc-mat-field"}
@@ -224,6 +253,10 @@
             (el :small {:class "wb-muted"}
                 "两个开关独立；默认关闭。自动建议只进入待审区。"))
         (el :div {:class "wb-row"}
+            ;; D-53: say whose materials this is before saying whether they
+            ;; are ready.  "材料库已就绪" alone let a panel that had dropped
+            ;; another session's snapshot look like this session's library.
+            (session-badge state)
             (badge (if (:ready? state) "材料库已就绪" "材料库未就绪")
                    (if (:ready? state) :ok :warn))
             (when (integer? (:revision state))
