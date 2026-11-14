@@ -166,6 +166,10 @@ Plain EDN only. No thread, task, socket, store handle, or write permit.
  :board map|nil              ; projection of the sole execution tenure board
  :session map|nil            ; hc.server.sessions metadata, via :session-port
  :calls {call-id call}
+ :worker-calls {call-id call} ; Plan-worker shell ledger (D-47): written
+                              ; only by `:worker-call/start|finish` through
+                              ; the mailbox; recovery marks `:running` as
+                              ; `:outcome-unknown`; never dispatches
  :runs {run-id run}          ; per model attempt: started/streaming/finished
  :scope {:book map :records []} ; hc.core.scope ledger
  :drafts {draft-id draft}    ; preserved composer drafts

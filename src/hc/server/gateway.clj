@@ -44,6 +44,10 @@
     :steward/state :steward/intent :steward/evidence
     :steward/decide :steward/transition
     :program/abandon
+    ;; The Plan-worker shell ledger (D-47) is written only by the devops
+    ;; worker thread through the Owner mailbox.  An operator closes a
+    ;; recovered record with `:call/ack`, never by writing the ledger.
+    :worker-call/start :worker-call/finish
     ;; Rebuilding the history index is an operator/server maintenance action.
     ;; Search and status stay browser-available and read-only.
     :history/reindex})

@@ -286,9 +286,11 @@
 
   Program sources, requests, model snapshots and credentials stay in the
   Owner state.  The operator needs identity, role, stage, and the
-  acknowledgement evidence to decide what to check."
-  [:call-id :kind :role :lane :tenure-id :agent-id :member :task-id
-   :created-at :finished-at :state :ack])
+  acknowledgement evidence to decide what to check.  A Plan-worker shell
+  record (D-47) also publishes its bounded command label, because that is
+  the only fact that tells the operator what to verify."
+  [:call-id :kind :role :lane :tenure-id :agent-id :worker-id :member
+   :task-id :label :created-at :finished-at :state :ack])
 
 (defn- call-view
   [session-id call]
@@ -305,6 +307,18 @@
       (assoc :phase (or (get-in call [:retry :phase]) state)
              :last-known-stage state))))
 
+(defn- unresolved-calls
+  "Every call-like record the operator may still have to check.
+
+  Scheduler calls live in `:calls`.  Plan dedicated-worker shell
+  invocations live in `:worker-calls`: they run inside the worker thread,
+  never dispatch, and a hard stop leaves them as `:outcome-unknown` after
+  recovery (D-47).  Both records share one operator panel, so they are
+  merged here rather than in the client."
+  [state]
+  (concat (vals (:calls state))
+          (vals (:worker-calls state))))
+
 (defn- unresolved-call-summaries
   "Publish the unknown calls and their operator acknowledgements per session.
 
@@ -314,8 +328,7 @@
   [owners]
   (into {}
         (keep (fn [[session-id owner]]
-                (let [calls (->> (get-in owner [:state :calls])
-                                 vals
+                (let [calls (->> (unresolved-calls (:state owner))
                                  (filter map?)
                                  (filter #(or (= :outcome-unknown (:state %))
                                               (map? (:ack %))))

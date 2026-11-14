@@ -2285,6 +2285,38 @@
                   {:ok? false
                    :error {:code :OWNER_UNAVAILABLE
                            :message "Owner is not available for devops"}}))))
+          ;; D-47: a Plan-worker `call` runs a managed shell inside the
+          ;; worker thread.  The ledger record must be Owner-committed
+          ;; before that shell starts, so a SIGKILL leaves a `:running`
+          ;; record that restart recovery turns into `:outcome-unknown`.
+          ;; This port is the only write path: the worker never touches
+          ;; Owner state directly (§5.1).
+          worker-call-command!
+          (fn [op command]
+            (loop [attempt 0]
+              (if-let [owner @owner-ref]
+                (let [epoch (get-in ((:snapshot owner))
+                                    [:state :commands :command-epoch] 1)
+                      result ((:submit-command! owner)
+                              {:command-id (str "worker-call-" (name op)
+                                                "-" (:call-id command))
+                               :command-epoch epoch
+                               :payload (assoc command :kind op)}
+                              15000)]
+                  (if (and (< attempt 1)
+                           (contains? #{:COMMAND_EPOCH_RETIRED
+                                        :COMMAND_EPOCH_UNKNOWN}
+                                      (get-in result [:error :code])))
+                    (recur (inc attempt))
+                    result))
+                {:status :refused
+                 :error {:code :OWNER_UNAVAILABLE
+                         :message "Owner is not available for the worker call ledger"}})))
+          devops-call-ledger
+          {:start! (fn [entry]
+                     (worker-call-command! :worker-call/start entry))
+           :finish! (fn [entry]
+                      (worker-call-command! :worker-call/finish entry))}
           executors {:shell {:run shell-exec :cancel cancel-shell}
                      :workspace {:run workspace-exec
                                  :cancel cancel-workspace}
@@ -2444,6 +2476,10 @@
           (app-devops/runner
            {:model-gateway devops-gateway
             :files-service (files/service {:root (:workspace-root config)})
+            ;; D-47: register every worker `call` in the Owner ledger
+            ;; before its shell starts, so a hard stop leaves recoverable
+            ;; evidence instead of a silent external side effect.
+            :call-ledger devops-call-ledger
             :helpers
             {:call
              (fn [arguments]

@@ -52,7 +52,12 @@
     :session/issue-epoch
     :session/attach-client
     :session/takeover
-    :session/detach-client})
+    :session/detach-client
+    ;; Trusted ledger commands for Plan-worker shell invocations (D-47).
+    ;; The devops worker thread submits these through the Owner mailbox;
+    ;; no browser may originate them.
+    :worker-call/start
+    :worker-call/finish})
 
 (def client-presence-kinds
   "Commands that manage multi-client presence rather than session work.
@@ -1661,19 +1666,42 @@
   is still needed."
   #{:succeeded :not-occurred})
 
+(defn- ledger-record
+  "Find one call-like record and the map it lives in.
+
+  Scheduler calls live in `:calls`; Plan-worker shell invocations live in
+  `:worker-calls` (D-47).  The operator panel publishes both, so an
+  acknowledgement must be able to close either.  The `:ledger` key names
+  the destination map."
+  [state call-id]
+  (if-let [call (state/call state call-id)]
+    {:ledger :calls :call call}
+    (when-let [call (state/worker-call state call-id)]
+      {:ledger :worker-calls :call call})))
+
+(defn- put-ledger-record
+  [state ledger call]
+  (assoc-in state [ledger (:call-id call)] call))
+
 (defn- ack-call
   "Close one :outcome-unknown call after an explicit operator check.
 
   The call id and its current state are the compare-and-set facts.  A stale
   or non-unknown call is refused with the current state; an identical repeat
-  returns the same acknowledgement without changing the call again."
+  returns the same acknowledgement without changing the call again.
+
+  A Plan-worker shell invocation (D-47) is acknowledged in its own ledger
+  map.  The conclusion is the same operator fact, so the same command kind
+  settles both; only the storage location differs."
   [state payload message ctx]
   (let [call-id (some-> (:call-id payload) str)
         outcome (some-> (or (:outcome payload) (:result payload)) keyword)
         expected (some-> (:expected-state payload) keyword)
         note (when (string? (:note payload))
                (subs (:note payload) 0 (min 500 (count (:note payload)))))
-        call (state/call state call-id)]
+        found (when call-id (ledger-record state call-id))
+        call (:call found)
+        ledger (:ledger found)]
     (cond
       (not (operator-command? message))
       (refused :CALL_ACK_OPERATOR_ONLY
@@ -1723,16 +1751,95 @@
                  :note note}
             call' (-> call
                       (assoc :state next-state
+                             :outcome next-state
                              :ack ack
-                             :acknowledged-at (:now ctx))
-                      (assoc-in [:retry :phase] next-state)
-                      (assoc-in [:ack :command-id] (:command-id message)))]
-        (accepted (state/put-call state call')
+                             :acknowledged-at (:now ctx)))
+            call' (cond-> call'
+                    ;; A worker shell record owns no retry plan; inventing
+                    ;; one would publish a misleading `:phase`.
+                    (contains? call :retry)
+                    (assoc-in [:retry :phase] next-state))
+            call' (assoc-in call' [:ack :command-id] (:command-id message))]
+        (accepted (put-ledger-record state ledger call')
                   {:status :accepted
                    :outcome :acknowledged
                    :call-id call-id
                    :call-state next-state
                    :ack ack})))))
+
+(defn- worker-call-start
+  "Record one Plan-worker shell invocation before its helper runs (D-47).
+
+  The devops worker calls this through the Owner mailbox; the Owner stays
+  the only writer (§5.1).  A browser-originated command is refused."
+  [state payload message ctx]
+  (if (operator-command? message)
+    (refused :WORKER_CALL_OPERATOR_FORBIDDEN
+             "browser-originated worker call ledger writes are forbidden"
+             {:action :trusted-worker-only})
+    (let [result (state/start-worker-call
+                  state
+                  (-> (select-keys payload
+                                   [:call-id :worker-id :tenure-id
+                                    :worker-call-id :helper :label])
+                      (assoc :created-at (:now ctx))))]
+      (if-not (:ok? result)
+        (refused (get-in result [:error :code])
+                 (get-in result [:error :message])
+                 (get-in result [:error :details]))
+        (accepted (:state result)
+                  {:status :accepted
+                   :outcome :worker-call-started
+                   :call-id (get-in result [:call :call-id])})))))
+
+(defn- worker-call-finish
+  "Settle one Plan-worker shell invocation after its helper returned (D-47)."
+  [state payload message ctx]
+  (if (operator-command? message)
+    (refused :WORKER_CALL_OPERATOR_FORBIDDEN
+             "browser-originated worker call ledger writes are forbidden"
+             {:action :trusted-worker-only})
+    (let [call-id (some-> (:call-id payload) str)
+          call (state/worker-call state call-id)
+          outcome (keyword (:outcome payload))]
+      (cond
+        (not (and call-id (not (str/blank? call-id))))
+        (refused :WORKER_CALL_ID_REQUIRED
+                 "a worker call settlement needs a non-blank :call-id"
+                 {:call-id call-id})
+
+        (nil? call)
+        (refused :UNKNOWN_WORKER_CALL
+                 "no worker call with this id exists in the current state"
+                 {:call-id call-id})
+
+        (contains? state/worker-call-terminal (:state call))
+        ;; A settlement is a compare-and-set: a duplicate is idempotent,
+        ;; a different outcome after one is fixed is late evidence.
+        (if (= outcome (:state call))
+          (accepted state
+                    {:status :accepted
+                     :outcome :already-settled
+                     :call-id call-id
+                     :call-state (:state call)})
+          (refused :WORKER_CALL_ALREADY_SETTLED
+                   "the worker call already has a fixed outcome"
+                   {:call-id call-id :current (:state call)}))
+
+        :else
+        (let [settled (state/finish-worker-call
+                       state
+                       {:call-id call-id
+                        :outcome outcome
+                        :summary (:summary payload)
+                        :error (:error payload)
+                        :finished-at (:now ctx)})]
+          (accepted settled
+                    {:status :accepted
+                     :outcome :worker-call-settled
+                     :call-id call-id
+                     :call-state (get-in settled
+                                         [:worker-calls call-id :state])}))))))
 
 (defn- apply-command-kind
   [state kind payload message ctx]
@@ -1814,6 +1921,12 @@
     :session/detach-client
     (detach-client state (command-client-id message))
     :session/issue-epoch (issue-epoch state ctx)
+    ;; Plan dedicated-worker shell ledger (D-47).  The worker thread submits
+    ;; these through the Owner mailbox; both handlers refuse an
+    ;; operator-originated command, and the browser gateway denies the kinds
+    ;; outright.
+    :worker-call/start (worker-call-start state payload message ctx)
+    :worker-call/finish (worker-call-finish state payload message ctx)
     (if (session-command-kind? kind)
       (session-command state payload message ctx)
       (refused :UNKNOWN_COMMAND_KIND

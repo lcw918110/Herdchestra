@@ -218,6 +218,13 @@
            ;; Trusted worker programs are scheduled asynchronously; the job
            ;; map is the receipt/outcome store keyed by job-id.
            :worker-jobs {}
+           ;; Plan dedicated-worker shell invocations (D-47).  These are
+           ;; Owner-committed call records, keyed by the worker's own call
+           ;; id, because a devops `call` runs an external command inside
+           ;; the worker thread.  They live beside `:calls` so recovery and
+           ;; the unresolved-call snapshot see one ledger; they are not
+           ;; scheduler calls and never dispatch.
+           :worker-calls {}
            ;; Keys already reported as :TOOL_ADMISSION_REFUSED_LIMIT for an
            ;; actor turn.  A successful admission removes the key; this
            ;; stops wake-actors from emitting the same diagnostic every round.
@@ -401,6 +408,131 @@
 (defn put-call
   [state call]
   (assoc-in state [:calls (:call-id call)] call))
+
+;; ---------------------------------------------------------------------------
+;; Plan dedicated-worker call ledger (D-47)
+
+(def worker-call-terminal
+  "Terminal ledger states for a worker shell invocation."
+  #{:succeeded :failed :cancelled :outcome-unknown})
+
+(def ^:private worker-call-history-limit
+  "Settled worker-call records retained per session.
+
+  The operator panel publishes the newest 20 rows; the ledger keeps more
+  than that so a check made later still has evidence, but it stays bounded
+  so a long session cannot grow the owner-state document without limit.
+  Unsettled records are never pruned."
+  64)
+
+(defn worker-call
+  [state call-id]
+  (get-in state [:worker-calls call-id]))
+
+(defn- bounded-text
+  [value limit]
+  (when (some? value)
+    (let [text (str value)]
+      (subs text 0 (min (long limit) (count text))))))
+
+(defn- prune-worker-calls
+  "Keep every unsettled record and the newest settled ones.
+
+  The published check list is bounded at 20 rows; the ledger keeps a
+  larger window so a check made later still has evidence, and never drops
+  an open obligation."
+  [worker-calls]
+  (let [records (vals worker-calls)
+        live (remove #(contains? worker-call-terminal (:state %)) records)
+        settled (->> records
+                     (filter #(contains? worker-call-terminal (:state %)))
+                     ;; A recovered or hand-built record may lack a start
+                     ;; time; ordering it first keeps pruning deterministic
+                     ;; instead of throwing on a nil comparison.
+                     (sort-by #(or (:created-at %) 0))
+                     (take-last (max 0 (- worker-call-history-limit
+                                          (count live)))))
+        kept (into {}
+                   (map (juxt :call-id identity))
+                   (concat live settled))]
+    kept))
+
+
+(defn start-worker-call
+  "Record one worker shell invocation as `:running` before it starts.
+
+  A duplicate live id is refused: the caller must never run two external
+  actions under one identity.  A settled record with the same id is also
+  refused, because a retried identity would make the ledger ambiguous.
+  Returns `{:ok? true :state :call}` or `{:ok? false :error}`."
+  [state {:keys [call-id worker-id tenure-id worker-call-id helper label
+                 created-at]}]
+  (cond
+    (not (and (string? call-id) (not (str/blank? call-id))))
+    {:ok? false
+     :error {:code :WORKER_CALL_ID_REQUIRED
+             :message "a worker call needs a non-blank :call-id"}}
+
+    (contains? (:worker-calls state) call-id)
+    {:ok? false
+     :error {:code :WORKER_CALL_DUPLICATE
+             :message "this worker call id already exists"
+             :call-id call-id
+             :state (get-in state [:worker-calls call-id :state])}}
+
+    :else
+    (let [call {:call-id call-id
+                :kind :shell
+                :role :plan-worker
+                :lane :plan
+                :tenure-id tenure-id
+                :agent-id worker-id
+                :worker-id worker-id
+                :worker-call-id worker-call-id
+                :member helper
+                :label (bounded-text label 200)
+                :state :running
+                :created-at created-at
+                :started-at created-at}]
+      {:ok? true
+       :call call
+       :state (update state :worker-calls
+                      (fn [worker-calls]
+                        (prune-worker-calls
+                         (assoc (or worker-calls {}) call-id call))))})))
+(defn finish-worker-call
+  "Settle one worker shell invocation.
+
+  `:outcome-unknown` is preserved: a helper that could not prove it ended
+  leaves the record open for the operator to check, exactly like an
+  interrupted scheduler call.  A missing record is a no-op so a failed
+  acceptance cannot fail the external action that already happened."
+  [state {:keys [call-id outcome summary error finished-at]}]
+  (let [call (worker-call state call-id)
+        outcome (if (contains? worker-call-terminal outcome)
+                  outcome
+                  :failed)]
+    (if-not call
+      state
+      (update state :worker-calls
+              (fn [worker-calls]
+                (prune-worker-calls
+                 (assoc (or worker-calls {}) call-id
+                        (cond-> (assoc call
+                                       :state outcome
+                                       :outcome outcome
+                                       :finished-at finished-at)
+                          (some? summary)
+                          (assoc :result
+                                 (select-keys summary
+                                              [:request-id :status
+                                               :exit-code :duration-ms
+                                               :cancelled? :published?]))
+                          (some? error)
+                          (assoc :error
+                                 (if (string? error)
+                                   {:message (bounded-text error 500)}
+                                   error))))))))))
 
 (defn append-diagnostic
   [state diagnostic]
@@ -1623,6 +1755,11 @@
   call is resumed immediately: a due retry becomes `:ready`; a future retry
   re-arms its fixed timer without moving `:retry-at`.
 
+  A `:worker-calls` record that was still `:running` ran an external
+  command inside the devops worker thread.  The restart has no process
+  handle and no executor terminal for it, so it becomes `:outcome-unknown`
+  and stays in the operator's check list.  It is never replayed.
+
   Every report that is still `:pending` gets a fresh `:pending` claim.  This
   includes a claim left in `:dispatching`, `:delivered`, or `:retry-wait`:
   the parent may have accepted the report, but the child cannot know it
@@ -1753,5 +1890,26 @@
                            (into {}
                                  (map (fn [[id node]]
                                         [id (recover-cancel-node node now)]))
-                                 (or nodes {}))))]
+                                 (or nodes {}))))
+        ;; D-47: a worker shell invocation runs inside the devops worker
+        ;; thread, not in a dispatcher task, so a restart has no local
+        ;; process handle and no executor terminal to wait for.  Its
+        ;; external result is unknown; the record must stay visible to the
+        ;; operator instead of disappearing.  An already-settled record is
+        ;; evidence and is left alone.
+        state (update state :worker-calls
+                      (fn [worker-calls]
+                        (into {}
+                              (map (fn [[call-id call]]
+                                     (if (contains? #{:running :dispatching}
+                                                    (:state call))
+                                       [call-id
+                                        (-> call
+                                            (assoc :state :outcome-unknown
+                                                   :outcome :outcome-unknown
+                                                   :finished-at now
+                                                   :recovered-orphan? true
+                                                   :recovered-at now))]
+                                       [call-id call])))
+                              (or worker-calls {}))))]
     (assoc state :updated-at now)))

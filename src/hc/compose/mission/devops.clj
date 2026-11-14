@@ -359,6 +359,10 @@
                           {:name name
                            :arguments arguments
                            :worker-id (:worker-id session)
+                           :tenure-id (:tenure-id session)
+                           ;; The devops call that owns this tool turn.  The
+                           ;; host ledger records it so a recovered worker
+                           ;; call can be traced to its caller.
                            :call-id (:call-id call)})]
               (cond
                 (map? result)

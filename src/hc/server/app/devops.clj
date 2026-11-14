@@ -70,19 +70,168 @@
                   {:code :READ_FAILED
                    :message "file read failed"})})))
 
+;; ---------------------------------------------------------------------------
+;; Recoverable worker-call ledger (D-47)
+
+(def ^:private label-limit
+  "Characters of a helper label kept as server-side evidence."
+  200)
+
+(defn- bounded-label
+  [value]
+  (let [text (cond
+               (nil? value) nil
+               (string? value) value
+               :else (try
+                       (ufss/write-str value)
+                       (catch Throwable _ (str value))))
+        text (str/trim (str text))]
+    (when-not (str/blank? text)
+      (subs text 0 (min label-limit (count text))))))
+
+(defn- call-label
+  "One short printable label for a host helper invocation.
+
+  A command helper carries the command text in `:command`; another helper
+  carries its name.  The label is evidence for the operator, never a
+  credential store, so it is bounded."
+  [helper arguments]
+  (or (bounded-label (:command arguments))
+      (bounded-label helper)
+      "host helper call"))
+
+(defn- helper-outcome
+  "Map one host helper result to one ledger outcome.
+
+  Recognized shell statuses keep their meaning: `:COMPLETED` with a
+  non-zero exit code is `:failed`, `:CANCELLED` is `:cancelled`, and
+  `:UNCERTAIN`/`:TIMEOUT` or a pending board publication is
+  `:outcome-unknown`.  Anything else is `:failed` unless the helper
+  returned a value with no status at all: an unknown shape must never be
+  reported as success."
+  [result]
+  (if-not (map? result)
+    :succeeded
+    (let [raw (:status result)
+          status (when (or (keyword? raw) (string? raw))
+                   (keyword (str/lower-case (name raw))))
+          exit (:exit-code result)]
+      (cond
+        (true? (:cancelled? result)) :cancelled
+        (contains? #{:cancelled :canceled} status) :cancelled
+        (contains? #{:uncertain :timeout} status) :outcome-unknown
+        (false? (:published? result)) :outcome-unknown
+        (contains? #{:completed :ok :succeeded :finished} status)
+        (if (and (integer? exit) (not (zero? (long exit))))
+          :failed
+          :succeeded)
+        (contains? #{:failed :error} status) :failed
+        (nil? status) :succeeded
+        :else :failed))))
+
+(defn- call-summary
+  "Bounded executor evidence kept with a ledger record.
+
+  The captured stdout/stderr and the full request stay in the shell
+  session; the Owner ledger holds only what an operator needs to decide
+  what to check."
+  [result]
+  (when (map? result)
+    (select-keys result
+                 [:request-id :status :exit-code :duration-ms
+                  :cancelled? :published?])))
+
+(defn- ledger-accepted?
+  [response]
+  (boolean
+   (or (true? (:ok? response))
+       (contains? #{:accepted :replayed} (:status response)))))
+
+(defn- ledger-start!
+  [ledger entry]
+  (try
+    ((:start! ledger) entry)
+    (catch Throwable error
+      {:ok? false
+       :error {:code :WORKER_CALL_LEDGER_FAILED
+               :message (or (.getMessage error) (str error))}})))
+
+(defn- ledger-finish!
+  "Settle one ledger record.  A failure here is never a helper failure: the
+  external action already happened, so a record that stays `:running` is
+  the honest evidence and recovery turns it into `:outcome-unknown`."
+  [ledger call-id outcome result error]
+  (try
+    ((:finish! ledger)
+     (cond-> {:call-id call-id :outcome outcome}
+       (some? result) (assoc :summary (call-summary result))
+       (some? error) (assoc :error error)))
+    (catch Throwable _ nil))
+  nil)
+
+(defn- ledgered-call
+  "Run one host helper after registering it in the recoverable ledger.
+
+  A helper whose start the host refused does not run: an external action
+  that cannot be recorded must not happen (AGENTS.md §5.3).  The start is
+  committed before the helper begins, so a hard process stop leaves a
+  `:running` record that restart recovery marks `:outcome-unknown`."
+  [{:keys [ledger helper helper-name arguments worker-id tenure-id
+           worker-call-id]}]
+  (let [call-id (str "worker-call-" (random-uuid))
+        started (ledger-start! ledger
+                               {:call-id call-id
+                                :worker-id worker-id
+                                :tenure-id tenure-id
+                                :worker-call-id worker-call-id
+                                :helper helper-name
+                                :label (call-label helper-name arguments)})]
+    (if-not (ledger-accepted? started)
+      (do
+        ;; The helper did not run.  A start that was merely unconfirmed may
+        ;; still have committed, so settle it as `:failed` with that reason;
+        ;; a missing record makes this a no-op.  A duplicate id names an
+        ;; older real action and must keep its own evidence.
+        (when-not (= :WORKER_CALL_DUPLICATE (get-in started [:error :code]))
+          (ledger-finish! ledger call-id :failed nil
+                          {:code :WORKER_CALL_START_UNCONFIRMED
+                           :message (str "the " helper-name
+                                         " invocation was not confirmed by "
+                                         "the Owner, so it was not run")
+                           :detail (:error started)}))
+        (tool-failed
+         {:status :failed
+          :code :WORKER_CALL_UNRECORDED
+          :message (str "the host did not record this " helper-name
+                        " invocation in the recoverable ledger, so it was "
+                        "not run")
+          :detail (:error started)}))
+      (try
+        (let [result (helper arguments)]
+          (ledger-finish! ledger call-id (helper-outcome result) result nil)
+          (tool-ok result))
+        (catch Throwable error
+          (ledger-finish! ledger call-id :failed nil
+                          (or (.getMessage error) (str error)))
+          (throw error))))))
+
 (defn tool-executor
   "Build the read-only tool executor for one workspace.
 
   `:files-service` is required.  `:helpers` optionally maps helper names to
   functions used by the `call` capability.  No helper is available unless the
   host supplies it.  Structured values are returned as EDN+UFSS text; `cat`
-  returns the file body verbatim."
-  [{:keys [files-service helpers]}]
-  (when-not files-service
-    (throw (ex-info "devops tool executor needs :files-service"
-                    {:code :FILES_SERVICE_REQUIRED})))
+  returns the file body verbatim.
+
+  `:call-ledger` optionally supplies the host's recoverable ledger ports
+  `:start!` and `:finish!`.  When present, every `call` invocation is
+  registered before the helper runs, so a hard process stop leaves a
+  `:running` record that restart recovery marks `:outcome-unknown` (D-47).
+  A refused registration refuses the helper: an external action that cannot
+  be recorded must not happen."
+  [{:keys [files-service helpers call-ledger]}]
   {:execute!
-   (fn [{:keys [name arguments]}]
+   (fn [{:keys [name arguments] :as invocation}]
      (let [arguments (or arguments {})
            name (str name)]
        (try
@@ -121,9 +270,21 @@
            "call"
            (let [helper-name (keyword (str (:name arguments)))
                  helper (get helpers helper-name)]
-             (if (fn? helper)
-               (tool-ok (helper (:arguments arguments)))
-               (tool-failed (str "no host helper named " (:name arguments)))))
+             (cond
+               (not (fn? helper))
+               (tool-failed (str "no host helper named " (:name arguments)))
+
+               call-ledger
+               (ledgered-call {:ledger call-ledger
+                               :helper helper
+                               :helper-name (str (:name arguments))
+                               :arguments (:arguments arguments)
+                               :worker-id (:worker-id invocation)
+                               :tenure-id (:tenure-id invocation)
+                               :worker-call-id (:call-id invocation)})
+
+               :else
+               (tool-ok (helper (:arguments arguments)))))
 
            (tool-failed (str "unknown devops tool " name)))
          (catch Throwable t
