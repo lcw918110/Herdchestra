@@ -118,8 +118,11 @@
 (deftest settle-window-reaches-a-child-forked-during-the-stop
   ;; `sh` forks its child a few milliseconds after start.  A stop that scans
   ;; once and signals immediately kills the parent before the fork, so the
-  ;; child is never born and never observed; the settle window exists so the
-  ;; stop sees the tree the caller is actually responsible for.
+  ;; child is never born and never observed.  The settle window delays the
+  ;; first signal so the stop sees the tree the caller is responsible for.
+  ;;
+  ;; The window is clamped to the grace it precedes (D-48), so this asks for a
+  ;; grace long enough to cover both the fork and the shutdown.
   (let [dir (temp-dir)
         pid-file (.resolve dir "late.pid")
         script (str "sleep 0.25; sleep 30 & echo $! > " pid-file "; wait")
@@ -128,10 +131,10 @@
         started (System/currentTimeMillis)]
     (try
       (let [result (process/stop-tree! process known
-                                       {:grace-ms 400 :settle-ms 1000})
+                                       {:grace-ms 1200 :settle-ms 900})
             elapsed (- (System/currentTimeMillis) started)
             child (read-pid pid-file)]
-        (is (>= elapsed 1000)
+        (is (>= elapsed 900)
             "the settle window delays the first signal instead of scanning once")
         (is (some? child)
             "the shell finished forking inside the settle window")
@@ -144,6 +147,26 @@
               "a child forked during the stop is still signalled")))
       (finally
         (force-kill! process [(read-pid pid-file)])))))
+
+(deftest settle-window-never-outlasts-the-grace-it-precedes
+  ;; A caller that lowers the grace below the default settle must not get a
+  ;; stop dominated by a parameter it never passed, and the settle must not
+  ;; eat the whole grace.  This is the clamp's contract.
+  (let [dir (temp-dir)
+        script "sleep 30"
+        process (shell-process dir script)
+        known (atom {})
+        started (System/currentTimeMillis)
+        result (process/stop-tree! process known
+                                   {:grace-ms 120 :settle-ms 5000})
+        elapsed (- (System/currentTimeMillis) started)]
+    (try
+      (is (true? (:signal-sent? result)))
+      (is (= [] (:alive result)))
+      (is (< elapsed 2500)
+          "a 120 ms grace does not wait out a 5 s settle request")
+      (finally
+        (force-kill! process [])))))
 
 ;; ---------------------------------------------------------------------------
 ;; one signal per pid
@@ -188,34 +211,35 @@
 ;; a recorded handle outlives its parent
 
 (deftest a-recorded-child-is-signalled-after-its-parent-exits
-  ;; `start-child-monitor!` records handles as it polls them.  The parent may
-  ;; exit before the stop runs, and then the ppid chain the monitor walked is
-  ;; already gone: the recorded handle is the only way left to reach the child.
-  ;; A stop that trusts a fresh descendant scan would find nothing, and the
-  ;; child would outlive the session with the write gate already released.
+  ;; `start-child-monitor!` records handles as it polls them, and only while
+  ;; the ppid chain still exists.  Once the parent dies its child reparents to
+  ;; init and a fresh `ProcessHandle.descendants` scan of the dead parent
+  ;; returns nothing.  The recorded handle is then the only way to reach the
+  ;; child; a stop that trusts a fresh scan leaves it running.
   (let [dir (temp-dir)
         pid-file (.resolve dir "recorded.pid")
+        ;; The parent stays alive just long enough for the monitor to poll the
+        ;; chain, then exits on its own as a crashed session would.
         process (shell-process dir
-                               (str "sleep 30 & echo $! > " pid-file "; exit 0"))
+                               (str "sleep 30 & echo $! > " pid-file
+                                    "; sleep 0.6"))
         known (atom {})
         monitor (process/start-child-monitor! process known 20)]
     (try
-      ;; The monitor polls the descendant chain while the parent is alive, which
-      ;; is the only moment that chain exists.
       (let [child (await-pid pid-file 5000)]
         (is (some? child) "the parent forked the child before exiting")
         (is (wait-until #(contains? @known child) 3000)
-            "the monitor records the child while the parent is alive")
+            "the monitor records the child while the parent is still alive")
         (is (wait-until #(not (.isAlive (.toHandle process))) 3000)
-            "the parent exited on its own, as a crashed session would")
+            "the parent exited on its own")
         (is (true? (live? child))
-            "the orphaned child keeps running; only the recorded handle reaches it")
-        (testing "the stop reaches the recorded child after the parent is gone"
+            "the orphaned child keeps running after its parent is gone")
+        (testing "the stop reaches the recorded child although the parent died"
           (let [result (process/stop-tree! process known
                                            {:grace-ms 300 :settle-ms 20})]
             (is (true? (:signal-sent? result))
-                "the recorded handle is signalled even though the fresh
-                 descendant scan of a dead parent returns nothing")
+                "the recorded handle is signalled even though a fresh
+                 descendant scan of the dead parent returns nothing")
             (is (= [] (:alive result)))
             (is (= [] (:errors result)))
             (is (wait-until #(not (live? child)) 3000)
