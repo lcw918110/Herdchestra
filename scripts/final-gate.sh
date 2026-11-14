@@ -494,17 +494,22 @@ stage_cljs() {
   local code log="$OUT/cljs.log"
   run_logged cljs bash scripts/test-cljs-gate.sh
   code=$RUN_CODE
-  local line selected passed failed
+  local line selected passed failed expected
   line="$(grep 'CLJS gate: selected=' "$log" | tail -1 || true)"
   selected="$(printf '%s\n' "$line" | sed -n 's/.*selected=\([0-9]*\).*/\1/p')"
   passed="$(printf '%s\n' "$line" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')"
   failed="$(printf '%s\n' "$line" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')"
-  if [ "$code" -ne 0 ] || [ "${selected:-0}" -ne 26 ] \
-     || [ "${passed:-0}" -ne 26 ] || [ "${failed:-1}" -ne 0 ]; then
-    stage_end 1 FAIL "cljs-exit=$code selected=${selected:-?} passed=${passed:-?} failed=${failed:-?}" \
+  # Count the harness table itself instead of repeating a magic number here.
+  # Every added harness (for example the D-42 negative gate) must show up as
+  # selected and passed; a skipped or silently dropped row still fails the
+  # stage because the totals no longer match the table.
+  expected="$(grep -cE '^test/js/[^|]+\|' scripts/test-cljs-gate.sh || true)"
+  if [ "$code" -ne 0 ] || [ "${selected:-0}" -ne "${expected:-0}" ] \
+     || [ "${passed:-0}" -ne "${expected:-0}" ] || [ "${failed:-1}" -ne 0 ]; then
+    stage_end 1 FAIL "cljs-exit=$code selected=${selected:-?}/${expected:-?} passed=${passed:-?} failed=${failed:-?}" \
       "${selected:-}" "" "${failed:-1}" 0
   else
-    stage_end 0 PASS "cljs-26/26" "${selected:-}" "" 0 0
+    stage_end 0 PASS "cljs-${selected}/${expected}" "${selected:-}" "" 0 0
   fi
 }
 
