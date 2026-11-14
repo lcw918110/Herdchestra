@@ -125,24 +125,6 @@
 - **建议**：让 devops worker 的 `call` 也登记为 Owner 可恢复的动作（或让 worker 会话把在途 shell 事实汇报给父 Owner），使 `recover-state` 能覆盖它；同时补一条针对该路径的验收。
 - **优先级**：中；当前 E2E 10 已用顶层 call 覆盖同类语义，但 worker 路径本身仍是盲区。
 
-## D-48 `stop-tree!` 的 `:settle-ms` 未随 `:stop-grace-ms` 一起收敛
-
-- **条款**：`AGENTS.md` §4.4（会话边界与停止语义）、§8.3 F11/F12。
-- **位置**：`src/hc/server/shell/process.clj` 的 `stop-tree!`：`:settle-ms` 默认 150，`:stop-grace-ms` 由 `runner :limits` 传入（默认 2000，测试可设 300）。
-- **缺口**：`stop-tree!` 在发第一轮信号前固定等待 `:settle-ms`，让 `sh` 完成 fork；该值不来自 `runner :limits`，调用点也无法按会话覆盖。
-- **影响**：每次停止至少多等 150 ms；若某个会话把 `:stop-grace-ms` 设得比 150 ms 更短（测试里就是 300），实际停止时长由 `:settle-ms` 而非 `:stop-grace-ms` 主导，参数语义不一致。
-- **建议**：把 `:settle-ms` 纳入 `runner :limits`（例如 `:stop-settle-ms`），并让 `session.clj` 的四个 `stop-tree!` 调用点统一透传；或按 `min(settle-ms, grace-ms)` 收敛。
-- **优先级**：低；不影响正确性，只影响停止延迟与参数一致性。
-
-## D-49 通知（notice）永不过期，可长期占据右上角
-
-- **条款**：`AGENTS.md` §7.4-4（过程区与错误状态）、§7.4-8（未交付理由必须可读且可关闭）。
-- **位置**：`src/hc/client/workbench/mutations.cljs:407-420` 只有 `notify` 与 `dismiss-notice`（需用户点 ×）；`src/hc/client/workbench/views/shell.cljs:472-476` 只渲染 `(take-last 3 notices)`。没有任何自动过期或去重。
-- **缺口**：`src/hc/client/workbench/events.cljc:1048-1058` 在服务端报告本轮中断时加入一条「服务器报告本轮未完成」通知。它会一直留到用户手动关闭；同类事件也不会合并。
-- **影响**：曾导致 `#wb-aux-toggle` 与 `#wb-aux-close` 在 1047 次命中测试中被通知的关闭按钮遮挡（见提交 `83ee20a` 的 CSS 修复，已把通知栈移出顶部栏、并把抽屉层级提到通知之上）。遮挡已修，但「通知永驻」本身仍会让界面越用越挤，且用户没有除逐条关闭之外的清理方式。
-- **建议**：给非 `:danger` 通知加自动过期（例如 8–15 秒，鼠标悬停时暂停）；同 key 通知去重并计数；提供「全部关闭」。`danger` 保留手动关闭。
-- **优先级**：低到中；遮挡症状已消除，剩下的是体验与可维护性。
-
 ## D-50 `#wb-aux-close` 与其他右上角控件缺少遮挡防护
 
 - **条款**：`AGENTS.md` §7.4-1（关键操作必须在各视口可达）。
@@ -151,21 +133,3 @@
 - **影响**：历史上已发生两次（`#wb-aux-toggle` 与 `#wb-aux-close` 各一次）。表现是「按钮看得见但点不动」，且 Playwright 会重试到整个测试预算耗尽，真正原因不出现在报错里。
 - **建议**：给右上角定义一个明确的层级序列（抽屉 > 通知 > topbar）并写成 CSS 变量注释；E2E 用 `clickUncovered`（已在 `e2e-19` 内）覆盖所有右上角控件；新增浮层时必须说明它在序列中的位置。
 - **优先级**：低；已有测试侧防护。
-
-## D-53 材料页不显示它当前服务哪个会话
-
-- **条款**：`AGENTS.md` §7.4-4（任务/资料视图必须能回答「这是谁的」）。
-- **位置**：`src/hc/client/materials/view.cljc:227`（只渲染 ready/未就绪徽标）。
-- **缺口**：面板不写它描述的是哪个会话。跨会话快照被丢弃时（`cross-session?`），投影
-  停在被清空的会话上，徽标仍是「材料库已就绪」，操作员无法从界面判断「这块面板描述的
-  不是我选中的会话」。
-- **已关闭的部分**（2026-11-12）：
-  1. `apply-snapshot` 丢弃快照时记录 `:last-rejected`（D-54 已实现）。
-  2. 桥接层见到新的 `:last-rejected` 就忘掉 `fetched-session`/`fetched-at`，让下一次
-     同步重新请求；并对未就绪投影排一次 200ms 自愈（`materials_bridge.cljs`
-     的 `retry-timer`）。会话切换时强制重取，不再被 1500ms 节流挡住。
-  3. `:materials/snapshot` 请求的 `:session-id` 由桥接层钉死为已校验的会话，避免
-     定时回调读到排队事务里的旧选择而请求旧会话。
-- **剩余缺口**：只差第 1 条——视图显示 `session-id`/标题。
-- **优先级**：中。数据正确性不受影响，只影响可读性。
-
