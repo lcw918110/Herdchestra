@@ -61,9 +61,24 @@
      :get (fn [ref] (get @blobs ref))
      :count (fn [] (count @blobs))}))
 
+(def max-preview-chars
+  "Longest readable snippet kept beside a blob reference.
+
+  This is deliberately independent of `max-inline-chars`, which decides
+  when content is offloaded.  A preview only identifies what the reference
+  holds — enough to tell a program source from a tool receipt in a list —
+  so it must not scale with the offload threshold.
+
+  Nothing in the runtime reads a preview: `restore-value` rebuilds through
+  the blob ref, and no view or export path touches `:request-preview` or
+  `:source-preview`.  Keeping a full kilobyte per settled call was pure
+  weight: at 500 turns it added 512000 chars to the committed document on
+  its own."
+  128)
+
 (defn- preview
   [text]
-  (subs text 0 (min max-inline-chars (count text))))
+  (subs text 0 (min max-preview-chars (count text))))
 
 (defn- reference
   [store text]

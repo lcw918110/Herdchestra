@@ -104,3 +104,23 @@
       (is (= state (:state (store/load-state plain)))
           "without the decorator the state is stored unchanged")
       (is (nil? (store/compaction-stats plain))))))
+
+(deftest a-blob-reference-keeps-only-a-short-snippet
+  (testing "the preview identifies the payload without copying it"
+    (let [blobs (compact/memory-blob-store)
+          state (settled-state 5)
+          [compacted _] (compact/compact-state state blobs)
+          requests (->> compacted
+                        :calls
+                        vals
+                        (map :request)
+                        (filter #(contains? % :request-ref)))]
+      (is (seq requests) "every settled call was offloaded")
+      (doseq [request requests]
+        (is (<= (count (str (:request-preview request)))
+                compact/max-preview-chars)
+            "a preview never exceeds the display bound")
+        (is (pos? (long (:request-bytes request)))
+            "the full size stays recorded for the operator")
+        (is (string? (:request-ref request))
+            "restore has a reference to read through")))))
