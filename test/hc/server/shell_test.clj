@@ -767,3 +767,34 @@
     (is (= [:running :finished]
            (mapv :phase @executed)))
     (is (every? #(= :advance-action (:op %)) @executed))))
+
+(deftest session-artifact-budget-caps-the-capture-before-registration
+  ;; Without the budget the capture writes up to the per-artifact limit and
+  ;; only registration discovers the session is full — after the operator
+  ;; waited for a run whose output was certain to be refused.
+  (with-root [root]
+    (let [g (gate/write-gate)
+          b (ready-board)
+          r (shell/runner {:root root :gate g :board b :artifact-dir root
+                           ;; 6 bytes left in the session budget
+                           :artifact-budget-fn (fn [_] 6)})
+          result (shell/run! r (request "r1"
+                                        ["sh" "-c"
+                                         (str "printf 0123456789")]))
+          artifact (get-in result [:output :artifact])]
+      (is (= :COMPLETED (:status result)))
+      (is (= 6 (:bytes artifact))
+          "the artifact is cut to what the session could still accept")
+      (is (true? (:truncated? artifact))))))
+
+(deftest a-broken-artifact-budget-falls-back-to-the-per-artifact-limit
+  ;; A probe failure must not silently drop output; unknown means "use the
+  ;; per-artifact limit" and let registration keep the final say.
+  (with-root [root]
+    (let [g (gate/write-gate)
+          b (ready-board)
+          r (shell/runner {:root root :gate g :board b :artifact-dir root
+                           :artifact-budget-fn (fn [_] (throw (ex-info "probe" {})))})
+          result (shell/run! r (request "r1" ["sh" "-c" "printf 0123456789"]))]
+      (is (= :COMPLETED (:status result)))
+      (is (= 10 (:bytes (get-in result [:output :artifact])))))))

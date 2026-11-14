@@ -385,6 +385,28 @@
                    total))
                0)))
 
+(defn session-bytes
+  "Bytes already committed to SESSION-ID's artifacts, counted once per content
+  ID.  Returns nil when the service cannot tell, so a caller can choose to
+  proceed rather than guess a budget."
+  [service {:keys [session-id partition exclude-content-id]}]
+  (try
+    (long (session-content-bytes service session-id partition exclude-content-id))
+    (catch Throwable _ nil)))
+
+(defn session-budget
+  "Remaining session artifact budget in bytes, or nil when unknown.
+
+  The capture path asks this before writing, so it can stop at the real limit
+  instead of producing a file that registration is certain to refuse."
+  [service {:keys [session-id partition exclude-content-id]}]
+  (let [limit (:session-limit-bytes (:opts service))
+        used (session-bytes service {:session-id session-id
+                                     :partition partition
+                                     :exclude-content-id exclude-content-id})]
+    (when (and (number? limit) (number? used))
+      (max 0 (- (long limit) (long used))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Registration
 

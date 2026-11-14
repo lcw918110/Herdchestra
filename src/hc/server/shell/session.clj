@@ -40,8 +40,13 @@
    :drain-timeout-ms 500
    :publish-retries 5})
 
+;; `artifact-budget-fn` is optional.  It answers "how many artifact bytes may
+;; this session still write?" so the capture can stop at the session limit
+;; instead of producing a file that registration is certain to refuse.  A nil
+;; or failing function means "unknown": the capture then uses the per-artifact
+;; limit alone and registration keeps the final authority.
 (defrecord ShellRunner [root gate board artifact-dir limits resolve-secret
-                        registry authorization])
+                        registry authorization artifact-budget-fn])
 (defrecord ShellSession [runner request-id request fingerprint state listeners
                          result-promise known-children])
 
@@ -867,14 +872,34 @@
       (finally
         (process/stop-child-monitor! monitor)))))
 
+(defn- session-artifact-budget
+  "Remaining artifact bytes for this session, or nil when the runner cannot
+  tell.  A failure or a non-number is treated as unknown, never as zero: the
+  capture must not silently drop output because a budget probe broke."
+  [runner request]
+  (when-let [f (:artifact-budget-fn runner)]
+    (try
+      (let [budget (f (:session-id request))]
+        (when (number? budget) (max 0 (long budget))))
+      (catch Throwable _ nil))))
+
 (defn- capture-options
   [runner request]
   (let [mode (:output-mode request)
-        limits (:limits runner)]
+        limits (:limits runner)
+        per-artifact (long (or (:artifact-limit mode)
+                               (:artifact-output-bytes limits)))
+        budget (session-artifact-budget runner request)
+        ;; The capture stops at whichever limit comes first.  Registration
+        ;; keeps the final authority; this only avoids writing a file that
+        ;; would certainly be refused, after the operator already waited.
+        artifact-limit (if (some? budget)
+                         (min per-artifact budget)
+                         per-artifact)]
     {:inline-limit (long (or (:inline-limit mode)
                              (:inline-output-bytes limits)))
-     :artifact-limit (long (or (:artifact-limit mode)
-                               (:artifact-output-bytes limits)))
+     :artifact-limit artifact-limit
+     :artifact-budget-known? (some? budget)
      :artifact-path (:artifact-path mode)
      :artifact-dir (:artifact-dir runner)
      :root (:root runner)}))
@@ -1037,12 +1062,16 @@
     :artifact-dir   directory for temporary artifact logs
     :limits         override output, poll, stop-grace or publish limits
     :resolve-secret (fn [ref] value) for :env-refs
+    :artifact-budget-fn (fn [session-id] remaining-bytes|nil); when present the
+                        capture stops at the session artifact budget instead of
+                        writing a file registration must refuse
 
   The gate is deliberately not created here.  A private gate would not be the
   workspace's shared W and would let a shell session overlap a protected
   commit."
   [opts]
-  (let [{:keys [root gate workspace-gate board artifact-dir limits resolve-secret]} opts
+  (let [{:keys [root gate workspace-gate board artifact-dir limits resolve-secret
+                artifact-budget-fn]} opts
         gate (cond
                (and gate (:gate gate) (not (:semaphore gate))) (:gate gate)
                gate gate
@@ -1060,7 +1089,8 @@
                    (merge default-limits limits)
                    resolve-secret
                    (atom {})
-                   :swarm-holder)))
+                   :swarm-holder
+                   artifact-budget-fn)))
 
 (defn read-only-runner
   "Compose the Plan dedicated-worker shell path.
@@ -1071,7 +1101,8 @@
   best-effort read-only path, not a sandbox; the normal `runner` remains the
   only Swarm-holder path."
   [opts]
-  (let [{:keys [root gate workspace-gate artifact-dir limits resolve-secret]} opts
+  (let [{:keys [root gate workspace-gate artifact-dir limits resolve-secret
+                artifact-budget-fn]} opts
         gate (cond
                (and gate (:gate gate) (not (:semaphore gate))) (:gate gate)
                gate gate
@@ -1089,7 +1120,8 @@
                    (merge default-limits limits)
                    resolve-secret
                    (atom {})
-                   :read-only)))
+                   :read-only
+                   artifact-budget-fn)))
 
 (defn start!
   "Accept a shell request and return a ShellSession immediately.

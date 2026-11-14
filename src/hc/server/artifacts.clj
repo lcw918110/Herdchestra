@@ -65,6 +65,10 @@
 (def safe-download-filename check/safe-download-filename)
 (def default-max-bytes check/default-max-bytes)
 
+;; Session budget, for callers that capture bytes before registering them
+(def session-bytes registry/session-bytes)
+(def session-budget registry/session-budget)
+
 ;; Failure classification
 (def expected-error? err/expected?)
 (def error-code err/code)

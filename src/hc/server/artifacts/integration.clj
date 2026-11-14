@@ -383,6 +383,8 @@
      :last-error (fn [] (last-error {:state state}))
      :retry-pending! (fn [publish!]
                        (retry-pending! {:service service :state state} publish!))
+     :session-budget (fn [request]
+                       (artifacts/session-budget service request))
      :content-type-fn (fn [content-id _metadata]
                         (get @types content-id))
      :snapshot (fn [session-id]
