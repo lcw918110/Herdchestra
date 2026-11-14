@@ -18,49 +18,12 @@
 - **影响**：用户付出等待后拿不到产物；临时文件与诊断更嘈杂，且截断/拒绝发生得过晚。
 - **建议**：把会话剩余预算传入捕获器（或由捕获器先查询现有字节），在写入前截断/拒绝并给明确理由；登记仍保留最终权威检查。
 
-## D-34 artifact 登记失败被静默吞掉
-
-- **条款**：`AGENTS.md` §7.2 四步产物提交流程与附录 §8.6。
-- **缺口**：`src/hc/server/app/system.clj:2472-2482` 的执行器终态回调用 `(try ... (catch Throwable _ nil))` 包住 `artifacts-integration/register-executor-result!`；登记或宣告抛出时没有诊断、没有重试、没有用户可见回执。
-- **影响**：产物可能已写入工作区却永远不登记、不宣告；用户看不到卡片，排障也找不到原因。
-- **建议**：捕获后记录结构化诊断（至少 `:code`、`:tool-call-id`、`:path`、异常消息），把登记失败放入可重试队列或 Owner outbox，并向用户给“产物未登记”的未交付理由。
-
-## D-35 artifact 第 1 步未校验文件属于任务工作区
-
-- **条款**：`AGENTS.md` §7.2（“任务工作区生成 → 检查 → 登记 → 宣告”）与 §4.2 受保护提交边界。
-- **缺口**：`src/hc/server/artifacts/registry.clj:527-556` 的 `check-source!` 只校验文件存在、非空、大小与可选 size 声明；`:workspace-root` 与 `:relative-path` 仅被记录到元数据（`registry.clj:177-179,427-430`），未强制 `:file`/`:source` 的真实路径位于该工作区内。调用方可以登记任意绝对路径。
-- **影响**：产物来源可以撒谎；越界文件被当作任务产物宣告，破坏“任务工作区生成”的边界与审计可信度。
-- **建议**：登记前规范化真实路径并验证位于 `:workspace-root` 内（符号链接按真实路径判断）；显式操作员导出可走单独入口，不复用产物登记。
-
-## D-36 announcement 返回 nil 被当成成功
-
-- **条款**：`AGENTS.md` §7.2 第 4 步“向用户宣告可用”与附录 §8.6。
-- **缺口**：`src/hc/server/artifacts/integration.clj:35-47` 的 `register-and-announce!` 只在 `(false? published)` 时抛 `:ARTIFACT_ANNOUNCEMENT_FAILED`；`publish!` 返回 `nil`（例如没有通道或回调漏返回）会被当作成功，随后 `mark-announced!` 把产物标成已宣告。
-- **影响**：产物被持久标为“已宣告”，但用户从未收到事件；重试路径也不会再补发。
-- **建议**：把“接受”定义为明确的 truthy 结果（或要求 `{:ok? true}` 形状）；nil 视为未接受并保留未宣告状态；没有 publisher 时显式区分“未配置宣告通道”。
-
 ## D-37 Owner chunk 未合并，`:calls`/`:conversation`/`:receipts` 无按条数保留策略
 
 - **条款**：`AGENTS.md` §5.1（单 Owner 状态迁移）、§6.1（流式阅读）与 §8.4 变更检查表。
 - **缺口**：`src/hc/compose/owner/AGENTS.md:1016-1026` 仍记录两项缺口：每个流式 chunk 逐次提交（未在 `deliver!` 前合并相邻 chunk，`src/hc/compose/owner/handlers.clj:511-515`、`state.clj:874-878` 仍是单 chunk 追加）；`:calls`、`:conversation`、`:receipts` 随会话增长，没有按条数/世代的保留或折叠策略。新增的 `src/hc/compose/owner/compact.clj` 与 `runtime.clj:369-380` 只在大状态超过阈值时压缩长字符串/回执载荷，不限制条目数量，也不改变 chunk 提交粒度。
 - **影响**：长流式回合放大持久层写放大；长会话的 Owner 整态 CAS 会越来越慢，最终逼近文档大小/提交成本边界。
 - **建议**：在 dispatch 的末端按时间窗或字节阈值合并相邻 chunk，一次提交一个合并块；为 `:calls`/`:conversation`/`:receipts` 定义显式保留/折叠策略（保留权威回执与未结调用，折叠已结算的细粒度记录），并保留现有按大小的 payload 压缩作为独立层。
-
-## D-39 高对比主题未进入机器对比度校验（静态 CSS 仅 color-scheme）
-
-- **条款**：`AGENTS.md` §7.4 旅程 1.1（正文对比度 ≥ 4.5:1、大字/关键图形 ≥ 3:1）。
-- **缺口**：`resources/public/css/workbench.css:69-71` 的 `html[data-contrast="high"]` 只声明 `color-scheme: light`，没有颜色变量；`test/hc/client/workbench/contrast_test.clj:62-66,392-410` 以 `root + light + high` 解析高对比主题，因此 high 的可计算颜色等于 light。运行时的 `src/hc/client/appearance.cljs:15-23` 另注入一份高对比变量（黑字、白底、深 accent/danger/warn/ok、无阴影），但对比度测试不读取该注入样式；E2E 19 的 `collectContrast` 也只覆盖 light/dark。
-- **影响**：产品声明“高对比”时，机器证据实际只证明 light；注入样式与静态 CSS 可能继续漂移，且 high 主题的 muted 文本、边框与状态色未纳入阈值校验。
-- **建议**：把高对比 palette 收敛进可解析的 `workbench.css`（或让 contrast 测试解析 `appearance.cljs` 的注入文本）；为 high 主题增加独立的正文、muted、边框、状态色探针，并在 E2E 19 加 high 采样。
-- **证据**：`resources/public/css/workbench.css:69-71`；`test/hc/client/workbench/contrast_test.clj:62-66,392-410`；`src/hc/client/appearance.cljs:15-23`；`test/e2e/e2e-19-ime-a11y.spec.mjs:354-367` 只采样 light/dark。
-
-## D-40 banner 提示背景使用 color-mix，无法机器计算对比度
-
-- **条款**：`AGENTS.md` §7.4 旅程 1.1（对比度门槛）。
-- **缺口**：`src/hc/client/conversation/view.cljs:161-163` 的 `.hc-banner-error/-warning/-info` 使用 `color-mix(in srgb, var(--wb-…) N%, var(--wb-surface))` 作为背景；`test/hc/client/workbench/contrast_test.clj` 无法解析 `color-mix`，其探针也没有 banner 项，E2E 对比度采样同样未覆盖 banner。
-- **影响**：三类用户可见的告警/状态 banner 的正文对比度没有机器证据；主题或 token 改变后可能低于 4.5:1 而不被发现。
-- **建议**：优先改用可解析的实色 token 或预先计算的双层 fallback，并让 contrast 测试解析 `color-mix`；同时为 `.hc-banner-*` 增加 light/dark/high 探针。
-- **证据**：`src/hc/client/conversation/view.cljs:161-163`；`test/hc/client/workbench/contrast_test.clj` 的探针没有 banner；E2E 对比度采样同样没有 banner 项。
 
 ## D-41 `/healthz` 的 `session-count` 仍为 O(N) 索引扫描
 
