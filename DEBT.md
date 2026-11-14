@@ -4,13 +4,6 @@
 
 编号不重排、不复用：已关闭条目（如 D-01、D-02、D-03、D-04、D-05、D-06、D-08–D-12、D-13–D-20、D-22、D-23、D-32）从本文件删除；历史状态见 git 历史与 `plans/debt-status-0.0.1.md`。新增条目从 D-38 起连续编号（D-38–D-46 已占用；D-32、D-38 已关闭但编号不复用）。
 
-## D-31 MSYS2/UCRT64 子环境绑定未实现
-
-- **条款**：`AGENTS.md` §7.2（环境供应：Pixi 与 MSYS2 的职责分工）。
-- **缺口**：`src/hc/server/shell/process.clj:49-55` 的 Windows 分支只把字符串命令交给 `cmd.exe /c`，没有绑定 MSYS2/UCRT64 子环境，也没有把项目声明的 Unix 工具链注入 `PATH`、`MSYSTEM`、`CHERE_INVOKING` 等变量。`src/hc/server/artifacts/AGENTS.md:294-295` 的 Windows 项仍标 `NOT RUN`。
-- **影响**：Windows 上的 holder/Plan dedicated worker 无法按 spec 使用项目的 bash 工具链；路径分隔符、权限与信号语义与 Unix 不一致，跨平台验收缺少可重复环境。
-- **建议**：显式探测 MSYS2/UCRT64 的 `bash.exe`，按会话构造环境（`MSYSTEM=UCRT64`、工作区路径转换），保留 `cmd.exe /c` 作为无 bash 时的诚实回退；补 Windows 冒烟并把运行范围写入证据。
-
 ## D-33 单会话 64 MiB artifact 累计上限在捕获阶段未知剩余预算
 
 - **条款**：`AGENTS.md` §7.2（artifact 64 MiB 上限）与附录 §8.6 产物提交流程。
