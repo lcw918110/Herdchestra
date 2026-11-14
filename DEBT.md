@@ -18,3 +18,16 @@
 - **chunk 合并已试过，不能这样做**：曾在 `dispatch.clj` 的 `deliver!` 按 1 KiB 阈值合并相邻 chunk，`recovered` 前的一切都正确，但取消路径暴露了真实缺陷——Agent 的 buffer 由发送侧持有，而「Esc 停止」由 Owner 侧最终化。仅靠 `:completed`/`:failed` 前的 flush 无法覆盖取消：`hc.compose.owner.runtime-test` 的 `streaming-cancellation-finalizes-partial-content` 显示，取消时阈值以下的文本从未提交，用户已看到的半句会消失。因此该改动已整体撤销（逐条提交保证不丢字）。正确形态需要发送侧在取消时**同步**flush 并让 Owner 等待该 flush 落库，或把 buffer 移到 Owner 侧（跨消息聚合），两者都改变取消时序契约，必须单独设计并验收。
 - **建议**：先把 buffer 放进 Owner 状态（每 attempt 一个 `:pending-chunk` 字段），由 Owner 在每次消息里合并，取消时由 Owner 自己 finalize——这样不存在发送侧与 Owner 的 flush 竞态；再为 `:conversation` 定义显式折叠策略（保留 reset 边界之后的权威消息与密封窗口所需的切片，把更早的已结算消息折叠为摘要并保留可追溯引用），同步更新 Pair-Hint 链与 sealed-view 的验收。
 - **触发条件**：已满足并已处理 `:calls` 与 `:runs` 两部分。剩余 `:conversation` 本体在 500 轮约 313 KB；要让它真正有界，必须先锁死普查报告 §8 的五条前提（sealed view 回溯上界、归档 blob 的随机可读性、下标连续性方案、Pair-Hint 投影不变的证明、归档触发的可观测性）。在那之前，改动 `:conversation` 的存储形态会同时破坏 `:PREFIX_DRIFT` 与 sealed view 两个契约，风险高于收益。
+
+## D-48 存储层 `normalize` 把同一文档序列化三次
+
+- **条款**：`AGENTS.md` §7.1（当前态持久化与故障恢复窗口）与 §8.4 变更检查表。
+- **缺口**：`src/hc/server/storage/migration.clj` 的 `normalize` 在每次提交时对同一份文档做三次全量序列化：
+  1. `migration.clj:180` 的 `(count (pr-str doc))`，只为检查是否超过 `:max-doc-chars`；
+  2. `migration.clj:146` 的 `digest` 里 `(pr-str (canonical-form (dissoc m :at :digest)))`；
+  3. `canonical-form`（`migration.clj:123-135`）自己还用 `(pr-str k)` 作 `sorted-map-by` 的比较器，对每个 key 再序列化一次。
+- **实测**：77 496 字符的文档，`normalize` 单次 8.11 ms，其中 `digest` 4.40 ms（54%）、`pr-str count` 1.12 ms。真实 Datalevin 提交 400 轮（344 502 字符）耗时 76.99 ms——即使文档体积已被 D-37 的三处修复压到原来的 28%，提交仍远超 20 ms。
+- **影响**：这是长会话提交成本的最大单项来源，高于 LMDB 写入（2.5%）与 fsync。D-37 修完体积后，它成为唯一的主导项。
+- **不建议的做法**：把 `:max-doc-chars` 检查删掉——它是 `:OWNER_STATE_TOO_LARGE` 唯一来源，删掉会让超限文档静默写入而非明确拒绝（`test/hc/server/storage/owner_state_size_test.clj` 专门锁这条）。把 `digest` 改成弱校验——digest 是迁移幂等与冲突判据，削弱它等于削弱存储合同。
+- **建议方向**：让 `normalize` 只序列化一次并把结果复用于长度检查与 digest 输入；`canonical-form` 的比较器需要稳定 key 序，可改用不依赖 `pr-str` 的等价比较（key 多为 keyword/string，天然可比），仅对混合类型 key 回退到 `pr-str`。改动触及存储核心，必须同时验证 `owner_state_size_test`、`owner_store_retry_test` 与幂等/冲突语义。
+- **触发条件**：任何会话进入 300 轮以上，或单次提交观测到超过 50 ms。
