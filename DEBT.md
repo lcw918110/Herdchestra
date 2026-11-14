@@ -33,15 +33,6 @@
 - **建议**：在 `sessions` 分区维护与索引更新同事务的 committed session count，健康端点读取该计数；若继续接受 O(N)，在 `HACK.md` 记录预算、测量口径与超过阈值时的降级为 `:unknown`。
 - **证据**：`src/hc/server/app/system.clj:5566-5580,5789-5801`；`src/hc/server/app/session_persistence.clj:443-445` 返回完整 `:ids`；已有测量为 1000 会话约 1.6 ms。
 
-## D-42 CLJS runner 的失败退出码缺少回归守卫
-
-- **条款**：`src/AGENTS.md` §5（测试必须真实失败）与 `AGENTS.md` §8.4（验证矩阵）。
-- **已修复部分**：`test/js/run_*.cjs` 曾出现 cljs.test 打印失败但进程仍 `exit 0` 的假绿；现 7 个 runner 捕获 `console` 输出里的 `N failures, M errors` 摘要，并在 `beforeExit` 强制把 `process.exitCode` 置 1，同时保留显式设置/解析 `process.exitCode`。合成探针已验证旧 runner exit 0、新 runner exit 1。
-- **剩余缺口**：没有一个**故意失败**的持久化回归测试证明 `scripts/test-cljs-gate.sh` 会在失败时返回非零；合成探针目前只是一次性证据。
-- **影响**：未来重构 runner、替换编译入口或改变 `beforeExit` 时序时，退出码传播可能再次退化为假绿，而正常全绿门禁无法发现。
-- **建议**：把合成探针固化为仅在 CI/显式开关下启用的必失败 fixture（或注入一个 failing test namespace），断言 Node/harness 返回非零、日志包含失败摘要，且门禁将其计入 failed；正常门禁不运行该 fixture。
-- **证据**：上述 runner 的 `console` 摘要捕获与 `beforeExit` 处理；`scripts/test-cljs-gate.sh` 按 `timeout ... bash "$script"` 的退出码统计 PASS/FAIL；`HACK.md` §17.21 的合成探针；仓库仍无持久化负向退出码测试。
-
 ## D-43 0.0.2 tag 曾发布 0.0.1 版本号（已用 fixup 修正，保留为流程记录）
 
 - **条款**：发布流程（版本 manifest、tag 与源码树一致性）。
