@@ -4,6 +4,7 @@
 
 编号不重排、不复用：已关闭条目（如 D-01、D-02、D-03、D-04、D-05、D-06、D-08–D-12、D-13–D-20、D-22、D-23、D-32）从本文件删除；历史状态见 git 历史与 `plans/debt-status-0.0.1.md`。新增条目从 D-38 起连续编号（D-38–D-46 已占用；D-32、D-38 已关闭但编号不复用）。
 
+
 ## D-37 `:conversation` / `:calls` / `:runs` 无保留策略，流式 chunk 逐条提交
 
 - **条款**：`AGENTS.md` §5.1（单 Owner 状态迁移）、§6.1（流式阅读）与 §8.4 变更检查表。
@@ -11,7 +12,7 @@
 - **已关闭的部分（二）**：`:runs` 的终态正文重复存储已在 `c6cc6c4` 关闭。每条终态 run 的回答同时存在于 run 的 `:text` 与 `:conversation` 的 assistant 消息里，实测重复占整文档 16.2%（500 轮 155000 字符、1000 轮 310000 字符）。`state/collapse-run-text` 保留最新 `:run-text-window`（默认 64）条终态 run 的正文，更早的只留 `:text-length`。活跃 run 与 actor run 永不折叠：前者靠 `:text` 累积，后者的 `put-assistant` 故意跳过 conversation，run 记录是那份回答的唯一副本。
 - **已关闭的部分（三）**：`:calls` 的 request snapshot 冗余已在 `62293e0`、`9348cbb`、`6d06a29` 关闭。每条 model call 冻结整份出站消息窗口，终态后无任何读者读 `[:request :snapshot :messages]`。实测带 32 条 300 字符窗口时 100 轮文档 1 817 818 字符，其中 89% 是这些快照。既有 `hc.compose.owner.compact/compact-state` 早就能做这个外置，但只在 `commit-message!` 一处、由 `:compact-threshold`（生产配 1000000）开关式触发；那个开关本身要 `(count (pr-str state))` 全量序列化一次，且文档会锯齿——55 轮压到 137 296 后 45 轮又长回 954 108。现在改为每次 commit 都压缩（`compact-state` 幂等），并把 store 在 `start!` 处包一层 `store/compacting-store`，让 5 处 commit 路径全部受保护而不只是消息路径。另把 `max-preview-chars` 从 `max-inline-chars` 解耦成独立的 128：preview 在 `compact.clj` 外零读者，之前每条已结算 call 白扛 1 KiB。合计后 500 轮文档从 3 654 616 降到 1 027 816（省 72%）。
 - **剩余缺口（一）**：每个流式 chunk 仍逐条提交。`src/hc/compose/owner/dispatch.clj:301-312` 的 `deliver!` 对每个 provider 事件直接 `post!`，`state.clj:1002-1012` 的 `append-run-text` 每次追加都把整段文本重新 `str` 拼接并重写 assistant 消息。实测 2000 个 chunk 得到 14.9 KB 文本、33.9 KB 文档，写放大与 chunk 数成正比。
-- **剩余缺口（二）**：只剩 `:conversation` 本身仍随会话线性增长且无上限。`c6cc6c4` 折叠了 run 的重复正文，`62293e0`/`9348cbb`/`6d06a29` 外置了 call 的 request 快照，但每条消息的原文仍必须在 `:conversation` 内联——它不是重复副本，是唯一副本。500 轮会话实测 312 849 字符（整文档 30.4%）。发布侧的 `snapshot.clj:725-735` window 只限制下发量，不限制 Owner 文档本体。
+- **剩余缺口（二）**：只剩 `:conversation` 本身仍随会话线性增长且无上限。`c6cc6c4` 折叠了 run 的重复正文，`62293e0`/`9348cbb`/`6d06a29` 外置了 call 的 request 快照，但每条消息的原文仍必须在 `:conversation` 内联——它不是重复副本，是唯一副本。合成 500 轮会话实测 33%（`:conversation` 占整文档三分之一）。发布侧的 `snapshot.clj:858-880` 每 tick 全量投影所有可见会话，见 D-50；那条路径只受 `:published-windows` 约束，不受 `history-window-size` 约束。
 - **已实测的当前水位**：500 轮会话在四处修复后共 1 027 816 字符，commit 5.48 ms（`2437e3b` 之前是 31.81 ms，因为 `compact-state` 为报 `:saved` 而做了两次全量 `pr-str`；加 `:measure? false` 后消除）。对照未修复的 3 654 616 字符，同会话省 72%、commit 快 5.8 倍。
 - **影响**：长会话的 Owner 整态 CAS 越来越慢；长流式回合放大持久层写。真实成本已实测：主力是 `hc.server.storage.migration/normalize` 的两次全量序列化——`migration.clj:180` 的 `(count (pr-str doc))` 约 36%，`migration.clj:146` 的 `(pr-str (canonical-form …))` + SHA-256 约 50%。LMDB `transact!` + `sync!` 只占 2.5%（`:nosync` 与 `:sync` 中位数几乎相同，fsync 不是瓶颈），提交后返回视图约 11%。线性拟合 `commit_ms = 2.99 + 0.0430 × turns`：20 ms 在约 400 轮越过，1 MiB 在约 2031 轮到达（那时约 89 ms）。中文载荷按 UTF-8 字节算 1 MiB 只需约 795 轮。**20 ms 阈值早已越过，且触发它的轮数远早于 1 MiB。**
 - **不能直接裁剪的原因**：`:conversation` 是 Scope/Pair-Hint 的权威源，也是 sealed view 的切片来源（`hc.core.scope.runtime/conversation->items`、`hc.compose.owner.state/project-conversation`）。`sealed-scope-view`（`state.clj:1357`）的 docstring 明写 "The Owner conversation is never trimmed"，实现靠 `conversation-call-index` 在任意位置定位 reset beat 再 `subvec`；中间挖洞会让下标语义失效。另有两处需要随机访问任意旧消息：`handlers.clj:828` 的 `mirror-history-message!`（操作员可编辑任意历史消息）与 `state.clj:1362` 的 `conversation-call-index`。完整读者普查见 `plans/D-37-retention-census.md`，其中列出 12 处读者（补上了先前遗漏的 4 处）。
@@ -32,3 +33,22 @@
 - **建议方向**：让 `normalize` 只序列化一次并把结果复用于长度检查与 digest 输入。改动触及存储核心，必须同时验证 `owner_state_size_test`、`owner_store_retry_test` 与幂等/冲突语义。
 - **已排除的做法**：不能把 `canonical-form` 的比较器换成 `compare`。实测 `(sort compare [:b "a" :a "b" :c "B"])` 直接抛 `ClassCastException`——`compare` 无法比较 `Keyword` 与 `String`。`pr-str` 比较器不是冗余，它是唯一能对混合 key 类型给出全序的办法；Owner 状态的 key 实测只有 `String` 与 `Keyword` 两种，正好落在 `compare` 办不到的区间。而且它的排序结果（String 在前、Keyword 在后）已经是 digest 的一部分，换掉会改变所有已存数据的 digest，破坏幂等比对。**这一项不是缺陷，是正确设计。** 因此 D-48 的可优化空间只剩「大小检查与 digest 复用同一次序列化」，上限约 14%（大小检查占 1.12/8.11 ms）。
 - **触发条件**：任何会话进入 300 轮以上，或单次提交观测到超过 50 ms。
+
+## D-49 终态 run 记录保留整份固定元数据，比 `:conversation` 更占文档
+
+- **条款**：`AGENTS.md` §5.1（单 Owner 状态迁移）、§7.1（当前态持久化）与 §8.4 变更检查表。
+- **缺口**：`c6ccc6c` 只折叠了终态 run 的 `:text`，整个 run 记录仍完整保留。实测 400 轮会话：`:runs` 占整文档 **50%**（205 304 / 413 172 字符），`:conversation` 占 33%，`:calls` 占 17%。单个终态 run 记录 491 字符，其中 `:text` 只占 32、`:message-id` 32，其余约 460 字符是固定元数据：`:role :lane :tenure-id :agent-id :status :nudge? :nudge-id :call-id :attempt-id :started-at :finished-at :late-events :tool-call-ids :context :context-attempt-id :error :cancel-reason :search-status :search-degraded? :search-failed?`。
+- **已完成的读者普查**（静态阅读，未运行）：Owner 层所有扫描 `:runs` 的循环都先判 `:status ∈ {:started :streaming}`，因此终态记录在这些路径里只做一次关键字比较——`conversation-stable?`（`state.clj:767`）、`active-run-for-call`（`state.clj:920`）、`finish-runs-for-call`（`state.clj:1159`）。发布侧的 `snapshot.clj:989` 读终态 run 的唯一目的是把 `:streaming?` 纠正为 false，按 `:message-id` 匹配，只需要「哪些 message-id 已终态」这一集合，不需要整条记录。`compact.clj:214` 与 `compact.clj:300` 对 `:runs` 逐条走 `compact-value`/`restore-value` 外置，不施加结构折叠。
+- **影响**：这是修完 `:calls` 与 run `:text` 之后**剩余的最大单项**，比 `:conversation` 本体更大。按线性增长估算，`:runs` 每轮约 513 字符，800 轮即 411 KB；它比 `:conversation` 更早把文档推向 8 000 000 字符的 `:OWNER_STATE_TOO_LARGE` 硬上限。
+- **不建议的做法**：不能删掉整条终态 run 记录。它是 `:message-id` → run 身份的唯一映射，`mirror-history-message!` 与发布侧的 streaming 纠正都依赖它；`recover-state`（`state.clj:1867`、`1892`、`1930`）在重启时按 `:status` 分流，也必须能看到这些记录。不能把 `:context` 无脑折叠——`start-run`（`state.clj:883`）把它写进 run，需先确认终态后有无读者。
+- **建议方向**：把终态 run 折叠为「身份 + 终态 + 时间 + 计数」的最小集，把 `:context` 与 `:tool-call-ids` 之外的明细外置到 blob 区（与 `:calls` 的 `:request :snapshot` 同一机制）。保守估计可去掉 460 字符/条 中的大部分。**必须先跑完整读者普查**：本条目只做了静态阅读，`test/` 下对 `:runs` 的直接断言（`compact_test.clj:40`、`run_text_window_test.clj:41`、`attempt_id_normalization_test.clj:48`、`handlers_test.clj:1285`）会受影响，须逐个判定是锁行为还是锁字段。
+- **触发条件**：任何会话进入 300 轮以上；或单次提交观测到文档超过 400 KB。
+
+## D-50 发布侧每 tick 全量投影所有会话的 `:conversation`
+
+- **条款**：`AGENTS.md` §7.3（瘦客户端状态边界与 `STATE_SNAPSHOT`）与 §8.5 性能目标。
+- **缺口**：`src/hc/server/app/snapshot.clj` 的 `snapshot`（约 858-880 行）把所有可见会话的**完整** `:conversation` 经 `conversation-view` 投影进 `:message/by-id` + `:message/order`，每一 tick 都这样做。同函数内已有的 `history-window-size` 与 `inactive-history-window-size` 只作用于 `:session-records` 的 `:messages`，**完全不作用于**这条路径。`inactive-history-window-size` 的 docstring 明写「Default to 0, so a large session list publishes no entities for sessions nobody opened」，但该意图只对 `:session-records` 生效。
+- **影响**：一个 500 轮会话在每次快照里都下发完整历史，即使客户端只打开一个会话；用户没打开的会话也全量下发。这与 §8.5 的「打开列表按需渲染」直接冲突。
+- **窗口化的已知陷阱**：`conversation-view` 经 `normalize-message` → `message-id` 计算每条消息的 id，最后一级回退是 `(str "message-" index)`，而 `index` 是**投影后向量里的位置**。一旦丢掉前缀，没有显式 id 的消息会整体改变 id；客户端看到的是身份全换而非增量追加，且 `:published-windows` 记录的旧 id 集合再也匹配不上，窗口逻辑会静默退化成「发布全部」。真实条目都带稳定 `:message-id`（`put-assistant` 写入 `"assistant-<call-id>-<attempt-id>"`），但该回退路径必须被证明不可达，或被改成保留原始下标。
+- **建议方向**：把两个窗口参数同样应用到 `conversations` 路径，并同步过滤 `:message/order`（客户端硬不变量：`:message/order` 必须恰好列出 `:message/by-id` 的全部键各一次，见 `src/hc/client/sync/AGENTS.md:230`）。窗口化必须保留原始下标，不能重排 `:conversation` 顺序。
+- **触发条件**：任何会话超过 `history-window-size`，或可见会话数超过 10。
