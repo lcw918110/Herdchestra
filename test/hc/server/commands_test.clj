@@ -1100,3 +1100,174 @@
       (is (= (:receipt resolved)
              (durable/receipt-for gate "app" "cmd-1"))))
     (durable/close! gate)))
+
+;; ---------------------------------------------------------------------------
+;; Receipt window bound (D-37)
+
+(deftest a-full-receipt-window-refuses-new-command-ids
+  (let [state (assoc (fresh-state)
+                     :max-receipts 2
+                     :receipts {})
+        filled (reduce (fn [state command-id]
+                         (:state (commands/accept
+                                  state
+                                  (request command-id {:text command-id})
+                                  {:status :accepted :command-id command-id})))
+                       state
+                       ["cmd-a" "cmd-b"])
+        fresh (commands/accept filled
+                               (request "cmd-c" {:text "cmd-c"})
+                               {:status :accepted :command-id "cmd-c"})
+        replay (commands/accept filled
+                                (request "cmd-a" {:text "cmd-a"})
+                                nil)
+        conflict (commands/accept filled
+                                  (request "cmd-a" {:text "different"})
+                                  nil)]
+    (is (= 2 (count (:receipts filled))))
+    (testing "a brand-new command id is refused instead of evicting a receipt"
+      (is (false? (:ok? fresh)))
+      (is (= :COMMAND_RECEIPT_WINDOW_FULL (get-in fresh [:error :code])))
+      (is (= :resync-state (get-in fresh [:error :action])))
+      (is (= 2 (:max-receipts (get-in fresh [:error :details]))))
+      (is (= filled (:state fresh))
+          "the refusal leaves the registry untouched"))
+
+    (testing "a replay still succeeds in a full window"
+      (is (true? (:ok? replay)))
+      (is (true? (:replayed? replay))))
+
+    (testing "a payload conflict still reports the conflict, not capacity"
+      (is (= :COMMAND_ID_PAYLOAD_CONFLICT (get-in conflict [:error :code]))))
+
+    (testing "rotating the epoch opens a fresh window"
+      (let [rotated (:state (commands/issue-epoch filled))
+            next-request (commands/accept rotated
+                                           (request "cmd-c" 2 {:text "cmd-c"})
+                                           {:status :accepted
+                                            :command-id "cmd-c"})]
+        (is (empty? (:receipts rotated)))
+        (is (true? (:ok? next-request)))))))
+
+(deftest a-durable-gate-default-bound-is-not-persisted
+  ;; The gate document carries no `:max-receipts`, so the built-in bound
+  ;; applies and a default installation never writes tuning into its state.
+  (let [store (durable/memory-store)
+        gate (durable/gate store)
+        window (durable-window 1 0)
+        accept! (fn [command-id]
+                  (durable/accept! gate window
+                                   (request command-id {:text command-id})
+                                   {:status :accepted
+                                    :command-id command-id}))]
+    (try
+      (is (nil? (:max-receipts (durable/state gate)))
+          "the default bound is not written into the document")
+      (dotimes [n 3]
+        (is (true? (:ok? (accept! (str "cmd-" n))))))
+      (is (true? (:ok? (accept! "cmd-0")))
+          "a replay of a stored command still succeeds")
+      (finally
+        (durable/close! gate)))))
+
+(deftest a-durable-gate-honours-a-lowered-receipt-bound
+  (let [initial {:command-epoch 1
+                 :retired-through 0
+                 :receipts {}
+                 :receipt-index {}
+                 :max-receipts 2}
+        store (durable/memory-store {:initial-state initial})
+        gate (durable/gate store)
+        window (durable-window 1 0)
+        accept! (fn [gate command-id]
+                  (durable/accept! gate window
+                                   (request command-id {:text command-id})
+                                   {:status :accepted
+                                    :command-id command-id}))]
+    (try
+      (is (= 2 (:max-receipts (durable/state gate)))
+          "the document bound is adopted by the open gate")
+      (is (true? (:ok? (accept! gate "cmd-a"))))
+      (is (true? (:ok? (accept! gate "cmd-b"))))
+      (let [fresh (accept! gate "cmd-c")
+            replay (accept! gate "cmd-a")]
+        (is (false? (:ok? fresh))
+            "a brand-new id is refused once the window is full")
+        (is (= :COMMAND_RECEIPT_WINDOW_FULL (get-in fresh [:error :code])))
+        (is (= :resync-state (get-in fresh [:error :action])))
+        (is (true? (:ok? replay))
+            "a stored command still replays without a second side effect")
+        (is (true? (:replayed? replay))))
+      (finally
+        (durable/close! gate)))
+
+    (testing "the bound survives a restart"
+      (let [reopened (durable/gate store)]
+        (try
+          (is (= 2 (:max-receipts (durable/state reopened)))
+              "a restart reuses the bound instead of growing past it")
+          (is (false? (:ok? (accept! reopened "cmd-d"))))
+          (finally
+            (durable/close! reopened)))))))
+
+(deftest a-full-window-never-dispatches-and-recovers-by-rotation
+  ;; The dispatch wrapper is the production path: it accepts a command
+  ;; before the side effect runs.  A full receipt window must therefore
+  ;; refuse *before* dispatch, not after, so a refusal never repeats work.
+  (let [initial {:command-epoch 1
+                 :retired-through 0
+                 :receipts {}
+                 :receipt-index {}
+                 :max-receipts 1}
+        store (durable/memory-store {:initial-state initial})
+        gate (durable/gate store)
+        window (durable-window 1 0)
+        calls (atom 0)
+        wrapper (dispatch/wrap
+                 {:gate gate
+                  :window-fn (constantly window)
+                  :scope-fn (constantly "s1")
+                  :dispatch! (fn [_ reply]
+                               (swap! calls inc)
+                               (let [result {:ok? true
+                                             :receipt {:status :accepted}}]
+                                 (reply result)
+                                 result))})
+        submit (fn [command-id epoch]
+                 ((:submit! wrapper)
+                  {:command-id command-id
+                   :command-epoch epoch
+                   :payload {:kind :session/create :title command-id}}
+                  identity))]
+    (try
+      (is (true? (:ok? (submit "cmd-1" 1))))
+      (is (= 1 @calls))
+      (let [refused (submit "cmd-2" 1)]
+        (is (false? (:ok? refused)))
+        (is (= :COMMAND_RECEIPT_WINDOW_FULL (get-in refused [:error :code])))
+        (is (= :resync-state (get-in refused [:error :action])))
+        (is (= 1 @calls)
+            "a refused command must not run its side effect"))
+      (testing "rotating the epoch lets the client continue"
+        (let [rotated (:state (durable/issue-epoch! gate))
+              next-window (durable-window 2 (:retired-through rotated))
+              wrapper-2 (dispatch/wrap
+                         {:gate gate
+                          :window-fn (constantly next-window)
+                          :scope-fn (constantly "s1")
+                          :dispatch! (fn [_ reply]
+                                       (swap! calls inc)
+                                       (let [result {:ok? true
+                                                     :receipt {:status :accepted}}]
+                                         (reply result)
+                                         result))})
+              resumed ((:submit! wrapper-2)
+                       {:command-id "cmd-2"
+                        :command-epoch 2
+                        :payload {:kind :session/create :title "cmd-2"}}
+                       identity)]
+          (is (= 2 (:command-epoch rotated)))
+          (is (true? (:ok? resumed)))
+          (is (= 2 @calls))))
+      (finally
+        (durable/close! gate)))))

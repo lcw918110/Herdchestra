@@ -134,6 +134,26 @@
             (some? details) (assoc :details details))
    :effects []})
 
+(def ^:private default-max-receipts
+  "Upper bound on receipts one epoch window may hold.
+
+  A receipt is the replay fence for one command id: dropping a settled one
+  turns a double-click into a second side effect, so the registry is never
+  trimmed.  Instead, once the window is full the gate refuses new command
+  ids and asks the client to re-read state, which rotates the epoch and
+  clears the registry.  The bound exists so one long-lived epoch cannot
+  grow the durable document without limit."
+  4096)
+
+(defn- receipts-full?
+  [state]
+  (let [limit (or (:max-receipts state) default-max-receipts)
+        registry (:receipts state)]
+    (and (integer? limit)
+         (pos? limit)
+         (map? registry)
+         (>= (count registry) limit))))
+
 (defn- accept*
   [state request receipt default-receipt?]
   (cond
@@ -189,12 +209,18 @@
         (let [stored-receipt (if default-receipt?
                                (accepted-receipt request)
                                receipt)
-              result (receipts/remember (:receipts state)
-                                        command-key
-                                        command-epoch
-                                        payload
-                                        stored-receipt
-                                        redact?)]
+              ;; A replay must still succeed in a full window, and a
+              ;; conflicting payload must still report the conflict.
+              ;; Only a brand-new command id can be refused for capacity.
+              known? (contains? (:receipts state) command-key)
+              result (if (and (not known?) (receipts-full? state))
+                       {:ok? false :reason :receipt-window-full}
+                       (receipts/remember (:receipts state)
+                                          command-key
+                                          command-epoch
+                                          payload
+                                          stored-receipt
+                                          redact?))]
           (if (:ok? result)
             {:ok? true
              :state (remember-index
@@ -222,6 +248,20 @@
                       (assoc :accepted-payload
                              (get-in result [:entry :payload])
                              :received-payload payload)))
+
+              :receipt-window-full
+              ;; Dropping a settled receipt would turn a replay into a
+              ;; second side effect.  Refusing a new command id keeps the
+              ;; fence and asks the client to re-read state, which rotates
+              ;; the epoch and starts an empty window.
+              (let [refused (fail state :COMMAND_RECEIPT_WINDOW_FULL
+                                  "this epoch's receipt window is full; re-read the current state before resubmitting"
+                                  {:command-id command-id
+                                   :command-epoch command-epoch
+                                   :current-epoch (:command-epoch state)
+                                   :max-receipts (or (:max-receipts state)
+                                                     default-max-receipts)})]
+                (assoc-in refused [:error :action] :resync-state))
 
               :epoch-mismatch
               (fail state :COMMAND_STATE_INVALID
@@ -386,12 +426,17 @@
                           (seq registry))
                    [{:invariant :receipts-without-active-epoch
                      :count (count registry)}]
-                   [])]
+                   [])
+          bound (when-let [limit (:max-receipts state)]
+                  (when-not (and (integer? limit) (pos? limit))
+                    [{:invariant :max-receipts-invalid
+                      :max-receipts limit}]))]
       (into [] (concat (epoch/check (window state))
                        registry-violations
                        index-violations
                        stale
-                       orphan)))))
+                       orphan
+                       bound)))))
 
 (defn redact-state
   "Remove legacy plaintext secret payloads from receipts and the index."
