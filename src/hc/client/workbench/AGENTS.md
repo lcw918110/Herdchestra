@@ -88,9 +88,13 @@
 - `:ui/sidebar-open` / `:ui/aux-open` 在宽屏是列状态，不是模态层。宽屏不得
   渲染 `.wb-drawer-backdrop`，`model/overlay-stack` 也必须返回空栈；否则固定
   覆盖层会盖住常驻列，拦截“关闭详情”等真实控件，Escape 也会抢走文本选区。
-- 窄屏打开抽屉时才渲染 `.wb-drawer-backdrop`。CSS 层级固定为覆盖层 `30`、
-  抽屉 `40`；抽屉关闭后使用 `visibility: hidden`，不能把屏幕外的控件留在
-  键盘 Tab 顺序里。
+- 窄屏打开抽屉时才渲染 `.wb-drawer-backdrop`。层级不写字面数字，一律取
+  `workbench.css` `:root` 的层叠阶梯变量（低到高：`--wb-z-sticky` 6 <
+  `--wb-z-composer` 20 < `--wb-z-backdrop` 30 < `--wb-z-topbar` 40 <
+  `--wb-z-notices` 50 < `--wb-z-popover` 55 < `--wb-z-drawer` 60）。
+  `contrast-test` 的 `stacking-ladder*` 断言阶梯值严格递增、无名字面量，
+  且右上角各面各占一档；新增浮层必须先在该注释里说明它压谁、被谁压。
+  抽屉关闭后使用 `visibility: hidden`，不能把屏幕外的控件留在键盘 Tab 顺序里。
 - 打开抽屉后焦点进入抽屉：导航抽屉聚焦 `#wb-nav-drawer`，详情抽屉聚焦
   `#wb-aux-close`。关闭（关闭按钮、覆盖层、Escape）后焦点回到真实开启者：
   `:ui/sidebar-return-id` / `:ui/aux-return-id`。会话头的“辅助面板”按钮 id

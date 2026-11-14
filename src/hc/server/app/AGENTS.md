@@ -27,8 +27,10 @@ publish a durable status that a reconnecting client can read.
 
 `/healthz` (and `--check`) computes `ok?` only from `store-open?` plus a
 non-nil `gateway-stats` plus an empty `component-errors` map. A session count
-is an observation, not a readiness condition: a nil or throwing count becomes
-`{:count :unknown}` and never turns health into 503. The body always carries
+is an observation, not a readiness condition: the count is one point read of
+the committed `:session-count` document (written in the same transaction as
+`:session-index`), and a nil, missing or throwing count becomes
+`{:count :unknown}` without turning health into 503. The body always carries
 `:version`, `:git-hash` and `:git-dirty?` from `hc.version/build-identity`;
 a source tarball outside Git reports `:git-hash "unknown"` rather than failing
 startup.

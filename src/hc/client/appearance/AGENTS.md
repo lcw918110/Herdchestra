@@ -8,7 +8,7 @@
 |---|---|
 | `model.cljc` | 偏好值的归一化、钳制、Fulcro 键映射与动作 reducer。不触 DOM、localStorage 或 Fulcro。 |
 | `view.cljc` | `settings-tree`：与 `hc.client.settings.view` 同形的 hiccup 节点树；原生按钮、range、checkbox，键盘行为交给平台。 |
-| `../appearance.cljs` | `apply!`：把归一化状态写到 `document.documentElement` 的 `data-*` 与 CSS 变量，并确保一段高对比度/减少动态的样式；另转发 `from-db`/`to-db`/`to-ui`/`settings-tree`。 |
+| `../appearance.cljs` | `apply!`：把归一化状态写到 `document.documentElement` 的 `data-*` 与 `--wb-font-scale`；高对比度配色与减少动态规则归 `resources/public/css/workbench.css`，运行时不再注入第二份样式。另转发 `from-db`/`to-db`/`to-ui`/`settings-tree`。 |
 
 ## 2 数据契约
 
@@ -32,7 +32,8 @@
 
 - 本目录不写 localStorage、不派发 Fulcro mutation、不改服务器状态或会话内容。
 - `:theme :system` 只表示“跟随系统”这一偏好值；实际媒体查询与样式解析由宿主/浏览器负责。
-- `apply!` 为 `:reduced-motion :system` 写 `data-reduced-motion="auto"`，并在样式块内用 `prefers-reduced-motion` 规则处理；`:reduce` 写 `true`，`:no-preference` 写 `false`。
+- `apply!` 为 `:reduced-motion :system` 写 `data-reduced-motion="auto"`；`workbench.css` 用 `prefers-reduced-motion` 规则处理该值，`:reduce` 写 `true`，`:no-preference` 写 `false`。
+- 高对比度是 `workbench.css` 里 `html[data-contrast="high"]` 的一整套变量（不含运行时注入副本），同一份声明由 `contrast_test.clj` 解析校验。
 - 持久化由 `hc.client.workbench.storage` 负责（只选 `:theme`、`:font-scale`、`:contrast`、`:reduced-motion` 四个键）。
 - `apply!` 可重复调用；没有 `js/document` 时是 no-op。
 

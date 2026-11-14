@@ -81,7 +81,7 @@ clojure -M:cljs:client -re node
 5. E2E 01–22 中与客户端相关的剧本按根 §8.5 执行；未运行就标 `NOT RUN`。
 6. Swarm/fleet dashboard：JVM 投影测试覆盖任务树、等待释放与父项不自动完成、槽位生命周期、holder/W 区分、完整 join 报告；CLJS 渲染测试用 `react-dom/server` 渲染真实 React/Framework7 元素树并检查可访问标签与响应式 CSS。
 7. 会话元数据控件：纯模型测试覆盖动作门控、命令 payload、回执文案与已删除列表归一化；`test/js/verify_session_controls_dom.sh` 在 jsdom 中挂载真实 `SessionControls`，点击重命名/置顶/归档/恢复/删除/永久删除，断言回调收到 keyword `:action` 与真实 `:session/*` kind，删除与永久删除需要第二次显式确认，永久删除只携带 `{:confirm? true}` 且不含工作区路径，回执未决时已打开的表单或确认框不能再次发送；`test/js/verify_workbench_session_commands.sh` 用真实命令 helper 证明已删除行只存在于 Fulcro 显示库 `:ui/session-list` 时仍按同一 `sid` 取得 Owner epoch，缺失会话不会借用 app 或其它会话 epoch；浏览器冒烟再验证只有服务器回执或下一份快照改变界面，已删除行不可选中且临时会话不进入已删除区。
-8. 工作台抽屉层：`model/overlay-stack` 只在 ≤1023px 抽屉布局把导航/详情当作 Escape 覆盖层；`test/js/verify_workbench_shell_dom.sh` 在 jsdom 挂载真实 `shell/workbench-content`，断言宽屏详情列打开时没有 `.wb-drawer-backdrop`、关闭按钮仍可提交，窄屏才渲染覆盖层，打开时焦点进入 `#wb-aux-close`、关闭时回到实际开启者。CSS 固定覆盖层 `z-index:30`、抽屉 `40`，关闭抽屉使用 `visibility:hidden` 退出 Tab 顺序。
+8. 工作台抽屉层：`model/overlay-stack` 只在 ≤1023px 抽屉布局把导航/详情当作 Escape 覆盖层；`test/js/verify_workbench_shell_dom.sh` 在 jsdom 挂载真实 `shell/workbench-content`，断言宽屏详情列打开时没有 `.wb-drawer-backdrop`、关闭按钮仍可提交，窄屏才渲染覆盖层，打开时焦点进入 `#wb-aux-close`、关闭时回到实际开启者。固定面的层级不写数字，一律取 `workbench.css` `:root` 的阶梯变量（`--wb-z-backdrop` 30 < `--wb-z-topbar` 40 < `--wb-z-notices` 50 < `--wb-z-popover` 55 < `--wb-z-drawer` 60），由 `contrast-test` 的 `stacking-ladder*` 断言递增且无名字面量，关闭抽屉使用 `visibility:hidden` 退出 Tab 顺序。
 9. 失败文案与纯逻辑导出：`hc.client.copy.failures-test` 覆盖 24 类内部映射、
    24→10 分类、三口径互异、`:saved?` 两分支、未知用量不写 0；用户侧三状态
    由视图按根 §7.4 呈现，不另建第二套状态模型；

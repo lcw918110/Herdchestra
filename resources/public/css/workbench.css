@@ -22,6 +22,43 @@
   --wb-radius: 12px;
   --wb-nav-width: 224px;
   --wb-aux-width: 320px;
+
+  /* Stacking ladder, low to high.  Every z-index in this file takes its value
+     from one of these rungs, and `contrast-test` fails on a literal number,
+     so a new floating surface cannot skip the ladder: it must pick a rung and
+     say what it may cover.  Declaration order is stacking order.
+
+       --wb-z-sticky    6  in-flow sticky rows inside the scroll flow (the
+                           data-center anchor row).  Below every fixed
+                           surface: nothing fixed paints under a row here.
+       --wb-z-composer 20  the sticky composer in the conversation surface.
+                           Above message content and the jump button; below
+                           the scrim so a dimmed page dims it too.
+       --wb-z-backdrop 30  the drawer scrim.  Above the page, below the bar
+                           so the bar's own buttons stay clickable, and below
+                           both drawers so it dims behind them.
+       --wb-z-topbar   40  the shell bar.  Above the scrim; below the notice
+                           stack, so a notice can never sit on a top-right
+                           button.  That overlap happened twice and both times
+                           the control stayed visible but unclickable.
+       --wb-z-notices  50  the notice stack.  Above the bar; below the
+                           popovers and drawers, because those are surfaces
+                           the user opened on purpose and a notice must never
+                           swallow their clicks.
+       --wb-z-popover  55  non-modal floating panels (the phone-width
+                           context panel).  Above the bar and notices; below
+                           the drawers, because a drawer is modal and owns
+                           the top-right corner while it is up.
+       --wb-z-drawer   60  the modal drawers.  Highest rung in this file:
+                           anything above it can hide a drawer's close button
+                           and leave the drawer impossible to exit. */
+  --wb-z-sticky: 6;
+  --wb-z-composer: 20;
+  --wb-z-backdrop: 30;
+  --wb-z-topbar: 40;
+  --wb-z-notices: 50;
+  --wb-z-popover: 55;
+  --wb-z-drawer: 60;
 }
 
 html[data-theme="dark"] {
@@ -940,11 +977,12 @@ button.wb-badge:hover {
 /* Modal layer for the <=1023px drawer layout only.  The shell does not render
    this button in the wide band: navigation and details are persistent grid
    columns there, and a fixed backdrop above them would intercept their
-   controls.  In the drawer layout the backdrop stays below both drawers. */
+   controls.  The scrim is the lowest fixed rung, so both drawers and every
+   bar control stay clickable while it is up. */
 .wb-drawer-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  z-index: var(--wb-z-backdrop);
   background: rgba(6, 12, 18, 0.46);
   border: 0;
 }
@@ -1007,15 +1045,16 @@ button.wb-badge:focus-visible,
 
 .wb-toast-stack {
   position: fixed;
-  /* Clear the topbar.  It is 56px tall with 6px vertical padding and sits at
-     the same z-index (50), so at `top: 16px` the stack's close button landed
-     exactly on `#wb-aux-toggle` and swallowed every click there — the toggle
-     became unusable for as long as a notice stayed on screen, and notices
-     never expire on their own.  Keeping the stack below the bar removes the
-     overlap at every width. */
+  /* Clear the topbar.  It is 56px tall with 6px vertical padding, and the
+     stack used to share its rung, so at `top: 16px` the stack's close button
+     landed exactly on `#wb-aux-toggle` and swallowed every click there — the
+     toggle stayed unusable for as long as a notice was on screen, and notices
+     never expire on their own.  The stack now sits on `--wb-z-notices`, below
+     the drawer rung, and this offset keeps it from covering the bar even
+     where the two bands meet. */
   top: 68px;
   right: 16px;
-  z-index: 50;
+  z-index: var(--wb-z-notices);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1059,14 +1098,15 @@ button.wb-badge:focus-visible,
     grid-template-columns: minmax(0, 1fr);
   }
 
-  /* The drawers are modal surfaces: while open they must sit above the
-     notice stack (z-index 50).  At 40 the stack's close button covered the
-     drawer's own close button in the top-right corner, so the drawer could
-     not be dismissed by pointer at all. */
+  /* The drawers are modal surfaces: while open they own the top-right corner,
+     so they sit on the highest chrome rung, above the notice stack.  While
+     they shared a rung with the stack, the stack's close button covered the
+     drawer's own close button and the drawer could not be dismissed by
+     pointer at all. */
   .wb-nav {
     position: fixed;
     inset: 0 auto 0 0;
-    z-index: 55;
+    z-index: var(--wb-z-drawer);
     width: min(var(--wb-nav-width), 82vw);
     transform: translateX(-102%);
     visibility: hidden;
@@ -1083,7 +1123,7 @@ button.wb-badge:focus-visible,
   .wb-aux {
     position: fixed;
     inset: 0 0 0 auto;
-    z-index: 55;  /* above the notice stack (50), same reason as .wb-nav */
+    z-index: var(--wb-z-drawer);  /* same rung as .wb-nav, same reason */
     width: min(var(--wb-aux-width), 88vw);
     transform: translateX(102%);
     visibility: hidden;
@@ -1109,11 +1149,14 @@ button.wb-badge:focus-visible,
     padding: 14px;
   }
 
-  /* Keep the real close trigger visible above the open drawer.  The drawer
-     starts at the top edge, so reserve the topbar height inside it. */
+  /* Lift the bar above the drawer scrim, which covers the whole viewport and
+     comes later in DOM order.  This is the bar rung, not a lift above the
+     drawers: an open drawer is modal and owns its own close control.  The
+     drawer reserves the bar height below (padding-top), so the bar stays
+     readable underneath it. */
   .wb-topbar {
     position: relative;
-    z-index: 50;
+    z-index: var(--wb-z-topbar);
   }
 
   .wb-nav,
@@ -3527,7 +3570,7 @@ html[data-theme="dark"] .hc-schedule-button--primary {
 .hc-data-subnav {
   position: sticky;
   top: 0;
-  z-index: 6;
+  z-index: var(--wb-z-sticky);
   display: flex;
   flex-wrap: wrap;
   gap: 6px 14px;

@@ -521,9 +521,10 @@ count capability:
 It returns `{:status :ok :count n}` or `{:status :unknown :error e}`.  The
 storage adapter point-reads the `:session-count` document and commits it in
 the same `commit-migration!` as `:session-index`, so the count and the id
-entries never disagree.  A store written before the document existed (or a
-restore that dropped it) has the index but no count; the adapter then counts
-the index ids, still one point read.  `ports/committed-session-count` is the
+entries never disagree; `storage/restore-state!` likewise rewrites it from
+the restored index in the restore transaction.  A store written before the
+document existed has the index but no count; the adapter then counts the
+index ids, still one point read.  `ports/committed-session-count` is the
 entry point: it uses this capability when present and otherwise counts
 `list-session-ids`, which is linear in the session count.  Health reads it
 instead of listing ids; a failed read is `:unknown`, never zero.

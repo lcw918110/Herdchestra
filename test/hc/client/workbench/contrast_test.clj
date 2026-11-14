@@ -18,8 +18,7 @@
   translucency stacking, or themed third-party widgets."
   (:require [clojure.java.io :as io]
             [clojure.string :as string]
-            [clojure.test :refer [deftest is testing]])
-  (:import [java.util.regex Pattern]))
+            [clojure.test :refer [deftest is testing]]))
 
 (def ^:private css-path "resources/public/css/workbench.css")
 
@@ -542,16 +541,18 @@
         (is (not= "#ffffff" (:resolved (resolve-vars (:light themes)
                                                      "--wb-ink")))
             "light ink is not white; a shared all-white set would prove nothing")
+        ;; Only these two tokens may legitimately keep the light value in the
+        ;; high-contrast palette: white is already the maximum background and
+        ;; white text on the dark accent is the same intent.
         (doseq [{:keys [var]} high-tokens
                 :let [raw (get-in themes [:high-contrast var])
                       light-raw (get-in themes [:light var])]
                 :when (and (string? raw) (string? light-raw))]
           (is (or (not= raw light-raw)
                   (= var "--wb-surface")
-                  (= var "--wb-accent-ink")
-                  (= var "--wb-bg"))
-              (str var " must not repeat the light value unless it is a "
-                   "deliberately shared white/grey token (" light-raw ")")))))))
+                  (= var "--wb-accent-ink"))
+              (str var " must differ from light unless it is a shared white "
+                   "token; both declare " light-raw)))))))
 
 (deftest banners-use-solid-resolvable-backgrounds
   (let [css (probe-css)
@@ -668,3 +669,197 @@
         (str "a required probe was skipped: "
              (pr-str (filter #(contains? required (:probe %))
                              skipped))))))
+
+;; ---------------------------------------------------------------------------
+;; Right-corner stacking ladder (D-50)
+;;
+;; The top-right corner is the shared landing spot of the shell bar, the notice
+;; stack, the phone context panel and the drawer close buttons.  Twice a
+;; floating surface came close enough to a control to cover it; the symptom was
+;; a control that stayed visible but unclickable, and Playwright retried until
+;; the whole test budget ran out without naming the coverer.
+;;
+;; `workbench.css` declares one ladder in `:root`.  These tests keep it a
+;; ladder: the rungs exist once, their values ascend in declaration order, the
+;; corner surfaces read a rung instead of a number, and no other rule may keep
+;; a literal.  They read source text, so they prove the declaration, not what
+;; the browser paints.
+
+(def ^:private ladder-rungs
+  "The ladder in stacking order, lowest first: [rung variable].  The order of
+  this vector is itself an assertion, so it is a specification, not a lookup."
+  [["sticky" "--wb-z-sticky"]
+   ["composer" "--wb-z-composer"]
+   ["backdrop" "--wb-z-backdrop"]
+   ["topbar" "--wb-z-topbar"]
+   ["notices" "--wb-z-notices"]
+   ["popover" "--wb-z-popover"]
+   ["drawer" "--wb-z-drawer"]])
+
+(def ^:private mandatory-rungs
+  "D-50 requires this chain: drawer > notices > topbar.  A ladder missing one
+  of the three could still look ordered while permitting the original overlap."
+  ["topbar" "notices" "drawer"])
+
+(defn- root-z-declarations
+  "The ladder's declarations in source order, as [[rung variable value] ...].
+
+  Only `:root` counts.  A rung redefined inside a media query would make the
+  sequence width-dependent, which is the drift these tests forbid."
+  [css]
+  (for [{:keys [selector body]} (css-blocks css)
+        :when (selector-match? selector ":root")
+        [property value] (declarations body)
+        :let [[_ rung] (re-matches #"--wb-z-([a-z-]+)" property)]
+        :when rung]
+    [rung property (string/trim value)]))
+
+(defn- parse-z [value]
+  (when (and value (re-matches #"-?\d+" value))
+    (Long/parseLong value)))
+
+(defn- ladder-values
+  "rung -> integer value, or nil when the rung is absent or not an integer."
+  [css]
+  (into {} (map (fn [[rung _ value]] [rung (parse-z value)])
+                (root-z-declarations css))))
+
+(defn- z-index-declarations
+  "[{:selector :value :rung}] for every z-index in the given CSS, in file order.
+  :rung is the variable named by var(...), or nil for a literal."
+  [css]
+  (for [{:keys [selector body]} (css-blocks css)
+        [property value] (declarations body)
+        :when (= property "z-index")]
+    {:selector (string/trim selector)
+     :value (string/trim value)
+     :rung (second (re-matches #"var\(\s*(--wb-z-[a-z-]+)\s*(?:,[^)]*)?\)"
+                               (string/trim value)))}))
+
+(deftest stacking-ladder-is-one-ordered-definition
+  (let [css (css-source)
+        declared (root-z-declarations css)
+        values (ladder-values css)]
+    (testing "every rung is declared exactly once, in :root"
+      (doseq [[rung variable] ladder-rungs]
+        (is (= 1 (count (filter (fn [[declared-rung declared-var _]]
+                                  (and (= rung declared-rung)
+                                       (= variable declared-var)))
+                                declared)))
+            (str variable " must be declared once for the " rung
+                 " rung; a second declaration makes the effective value depend "
+                 "on source order"))
+        (is (some? (values rung))
+            (str "the ladder declares no integer value for " variable))))
+    (testing "declaration order is stacking order, strictly ascending"
+      (let [declared-order (map first declared)
+            expected-order (map first ladder-rungs)]
+        (is (= expected-order declared-order)
+            (str "the ladder must be written lowest first, in this order: "
+                 (pr-str expected-order) ", got " (pr-str declared-order)))
+        (let [ordered (map values expected-order)]
+          (is (every? some? ordered)
+              (str "a rung is missing or not an integer: " (pr-str ordered)))
+          (is (every? (fn [[low high]] (< low high))
+                      (partition 2 1 (remove nil? ordered)))
+              (str "every rung must outrank the one before it: "
+                   (pr-str (map vector expected-order ordered)))))))
+    (testing "the chain D-50 requires holds by value, not by intent"
+      (is (< (values "topbar") (values "notices") (values "drawer"))
+          (str "topbar < notices < drawer must hold, got "
+               (pr-str (map vector mandatory-rungs
+                             (map values mandatory-rungs))))))))
+
+(def ^:private corner-surfaces
+  "selector -> the rung it must sit on.  These surfaces meet in the top-right
+  corner; a new one belongs in this map as well as in the ladder comment."
+  {".wb-drawer-backdrop" "backdrop"
+   ".wb-toast-stack" "notices"
+   ".wb-topbar" "topbar"
+   ".wb-nav" "drawer"
+   ".wb-aux" "drawer"})
+
+(deftest top-right-surfaces-take-values-from-the-ladder
+  (let [css (css-source)
+        declared (z-index-declarations css)
+        by-selector (group-by :selector declared)
+        rung-var (into {} ladder-rungs)]
+    (testing "each corner surface names its own rung, never a bare number"
+      (doseq [[selector rung] (sort-by key corner-surfaces)]
+        (is (seq (get by-selector selector))
+            (str selector " declares no z-index; this guard would be blind"))
+        (is (= 1 (count (get by-selector selector)))
+            (str selector " declares z-index more than once; the later "
+                 "declaration silently hides the first"))
+        (doseq [decl (get by-selector selector)]
+          (is (= (rung-var rung) (:rung decl))
+              (str selector " must sit on rung " rung " (" (rung-var rung)
+                   "), got " (pr-str (:value decl)))))
+        (is (some? (ladder-values css)))))
+    (testing "no floating rule in the stylesheet keeps a literal z-index"
+      (let [literals (remove :rung declared)]
+        (is (empty? literals)
+            (str "a bare z-index bypasses the ladder: "
+                 (pr-str (map (juxt :selector :value) literals))))))
+    (testing "every z-index names a rung that :root declares"
+      (let [known (set (vals rung-var))
+            unknown (remove #(contains? known (:rung %)) declared)]
+        (is (empty? unknown)
+            (str "a rule names a rung :root never declares: "
+                 (pr-str (map (juxt :selector :rung) unknown))))))
+    (testing "the corner chain is drawer > notices > topbar, strictly"
+      (let [values (ladder-values css)
+            topbar (values "topbar")
+            notices (values "notices")
+            drawer (values "drawer")]
+        (is (< topbar notices)
+            (str ".wb-topbar must stay below .wb-toast-stack: " topbar " < "
+                 notices))
+        (is (< notices drawer)
+            (str ".wb-toast-stack must stay below the drawers: " notices " < "
+                 drawer))))))
+
+(deftest conversation-surface-shares-the-ladder
+  ;; The conversation surface owns its own inline stylesheet, so its floating
+  ;; rules are a second place where a literal can creep back in.
+  (let [declared (z-index-declarations (conversation-css))]
+    (is (seq declared)
+        (str "the conversation surface declares no z-index at all; if its "
+             "floating rules moved, update this guard instead of deleting it"))
+    (testing "the surface resolves rungs from workbench.css rather than numbers"
+      (let [literals (remove :rung declared)]
+        (is (empty? literals)
+            (str "a bare z-index in the surface bypasses the ladder: "
+                 (pr-str (map (juxt :selector :value) literals))))))
+    (testing "the phone context panel stays under the drawers"
+      ;; It is fixed across the full width at top:64px, so at drawer width it
+      ;; would cover #wb-aux-close if it outranked the drawer rung.
+      (let [panel (first (filter #(= ".hc-context-panel[open]" (:selector %))
+                                 declared))]
+        (is (some? panel) "the phone context panel declares no z-index")
+        (is (= "--wb-z-popover" (:rung panel))
+            (str "the panel must sit on the popover rung, below the drawers; "
+                 "got " (pr-str (:value panel))))))))
+
+(deftest ladder-documentation-states-the-order
+  ;; The comment block is the human half of the constraint: whoever adds the
+  ;; next floating surface is meant to read it and pick a rung.  The block sits
+  ;; inside :root, immediately above the first rung declaration.
+  (let [css (css-source)
+        ;; A declaration, not a mention: the comment above the rungs also spells
+        ;; the variable names, so only "--wb-z-sticky:" identifies the first
+        ;; real declaration.
+        first-decl-at (string/index-of css "--wb-z-sticky:")
+        comment-open (when first-decl-at
+                       (string/last-index-of css "/*" first-decl-at))
+        comment-close (when comment-open
+                        (string/last-index-of css "*/" first-decl-at))
+        comment (when (and comment-open comment-close
+                           (< comment-open comment-close first-decl-at))
+                  (subs css comment-open comment-close))]
+    (is (some? comment)
+        (str "the ladder's rationale comment must sit above the first rung "
+             "declaration, inside :root"))
+    (doseq [[rung variable] ladder-rungs]
+      (is (string/includes? (or comment "") variable)
+          (str "the ladder comment does not explain " variable " (" rung ")")))))

@@ -1,5 +1,5 @@
 // E2E 19: keyboard navigation, 200% font scale, IME composition, focus return,
-// the Escape hierarchy, the accessibility tree and light/dark contrast.
+// the Escape hierarchy, the accessibility tree and light/dark/high contrast.
 //
 // Real screen readers, real touch hardware and a real input method are not
 // available to this harness; they are recorded as `manualResidual` instead of
@@ -85,6 +85,19 @@ async function setFontScale(page, value) {
     const input = document.querySelector('#hc-appearance-font-scale');
     return Boolean(input && input.getAttribute('aria-valuenow') === String(expected));
   }, value, { timeout: 5000 });
+}
+
+// The appearance section's own checkbox drives `data-contrast`.  Clicking the
+// label would toggle twice on some browsers (label plus input), so the input
+// is clicked directly and the result is verified on the root element.
+async function setContrast(page, high) {
+  const checkbox = page.locator('#hc-appearance-contrast').first();
+  await checkbox.waitFor({ state: 'visible', timeout: 20000 });
+  const checked = await checkbox.isChecked();
+  if (checked !== high) await checkbox.click();
+  await page.waitForFunction((expected) =>
+    document.documentElement.dataset.contrast === (expected ? 'high' : 'normal'),
+  high, { timeout: 5000 });
 }
 
 async function setTheme(page, label) {
@@ -299,7 +312,7 @@ test('@core @a11y E2E 19 keyboard, 200% text, IME, focus return and AX tree', as
     marker: MARKER,
     checks,
     diagnostics,
-    contrast: { light: [], dark: [] },
+    contrast: { light: [], dark: [], high: [] },
     manualResidual: {
       screenReaderReadingOrder: 'not automated',
       realTouchHardware: 'not automated',
@@ -478,7 +491,7 @@ test('@core @a11y E2E 19 keyboard, 200% text, IME, focus return and AX tree', as
     assert(checks.tabOrderMatchesVisual, `tab order moved backwards: ${JSON.stringify(order.violations)}`);
     evidence.screenshots.push(await shot(page, dir, 'e2e19-01-keyboard'));
 
-    // --- Contrast at 100% in both themes --------------------------------
+    // --- Contrast at 100% in light, dark and high contrast ---------------
     await openAppearance(page, app.url);
     await setTheme(page, '浅色');
     await showSessions(page);
@@ -497,6 +510,54 @@ test('@core @a11y E2E 19 keyboard, 200% text, IME, focus return and AX tree', as
     assert(checks.contrastDark,
       `dark contrast failed: ${JSON.stringify(evidence.contrast.dark.filter((row) => row.found && !row.skipped && !row.ok))}`);
     evidence.screenshots.push(await shot(page, dir, 'e2e19-02-dark-contrast'));
+
+    // --- High contrast on top of dark, sampled from the live page ---------
+    // High contrast writes a complete palette into workbench.css.  Sampling
+    // it here proves the browser paints those values, not a second copy
+    // injected at runtime: the probe reads computed styles of real nodes.
+    await openAppearance(page, app.url);
+    await setTheme(page, '深色');
+    await setContrast(page, true);
+    await showSessions(page);
+    evidence.contrast.high = await collectContrast(page, CONTRAST_SPECS);
+    evidence.contrast.highSkipped = skippedContrast(evidence.contrast.high);
+    checks.contrastHigh = contrastPass(evidence.contrast.high, REQUIRED_CONTRAST);
+    assert(checks.contrastHigh,
+      `high contrast failed: ${JSON.stringify(evidence.contrast.high.filter((row) => row.found && !row.skipped && !row.ok))}`);
+    evidence.highContrastPalette = await page.evaluate(() => {
+      const style = getComputedStyle(document.documentElement);
+      const token = (name) => style.getPropertyValue(name).trim();
+      return {
+        contrastAttribute: document.documentElement.dataset.contrast,
+        themeAttribute: document.documentElement.dataset.theme,
+        ink: token('--wb-ink'),
+        background: token('--wb-bg'),
+        line: token('--wb-line'),
+        bannerError: token('--wb-banner-error-bg'),
+        bannerWarning: token('--wb-banner-warning-bg'),
+        bannerInfo: token('--wb-banner-info-bg'),
+      };
+    });
+    // High contrast was switched on while the dark theme was active, so this
+    // also proves the palette wins over `html[data-theme="dark"]`.
+    checks.highContrastPaletteApplied =
+      evidence.highContrastPalette.contrastAttribute === 'high'
+      && evidence.highContrastPalette.themeAttribute === 'dark'
+      && evidence.highContrastPalette.ink === '#000000'
+      && evidence.highContrastPalette.background === '#ffffff';
+    assert(checks.highContrastPaletteApplied,
+      `high contrast is not painted over dark: ${JSON.stringify(evidence.highContrastPalette)}`);
+    checks.highContrastBannersSolid = [
+      evidence.highContrastPalette.bannerError,
+      evidence.highContrastPalette.bannerWarning,
+      evidence.highContrastPalette.bannerInfo,
+    ].every((value) => /^#[0-9a-f]{6}$/i.test(value));
+    assert(checks.highContrastBannersSolid,
+      `a banner background is not a resolvable solid color: ${JSON.stringify(evidence.highContrastPalette)}`);
+    evidence.screenshots.push(await shot(page, dir, 'e2e19-02b-high-contrast'));
+    // Clear high contrast before the next phase measures 200% text.
+    await openAppearance(page, app.url);
+    await setContrast(page, false);
 
     // --- 200% font scale -------------------------------------------------
     await openAppearance(page, app.url);
@@ -857,6 +918,7 @@ test('@core @a11y E2E 19 keyboard, 200% text, IME, focus return and AX tree', as
         desktopTargets: evidence.desktopTargets,
         compactTargets: evidence.compactTargets,
         contrast: evidence.contrast,
+        highContrastPalette: evidence.highContrastPalette,
         ime: evidence.ime,
         diagnostics,
         focusSequence: evidence.focusSequence,
@@ -906,6 +968,7 @@ test('@core @a11y E2E 19 keyboard, 200% text, IME, focus return and AX tree', as
         ariaSnapshotChars: evidence.ariaSnapshotChars,
         manualResidual: evidence.manualResidual,
         screenshots: evidence.screenshots,
+        highContrastPalette: evidence.highContrastPalette,
         error: error.message,
       },
       checks,
