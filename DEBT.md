@@ -5,13 +5,13 @@
 编号不重排、不复用：已关闭条目（如 D-01、D-02、D-03、D-04、D-05、D-06、D-08–D-12、D-13–D-20、D-22、D-23、D-32）从本文件删除；历史状态见 git 历史与 `plans/debt-status-0.0.1.md`。新增条目从 D-38 起连续编号（D-38–D-46 已占用；D-32、D-38 已关闭但编号不复用）。
 
 
-## D-37 `:conversation` / `:calls` / `:runs` 无保留策略，流式 chunk 逐条提交
+## D-37 `:conversation` 无上限（`:calls`、`:runs` 正文与流式 chunk 已关闭）
 
 - **条款**：`AGENTS.md` §5.1（单 Owner 状态迁移）、§6.1（流式阅读）与 §8.4 变更检查表。
 - **已关闭的部分**：`:receipts` 的无限增长已在 `752060a` 关闭——窗口满时用 `:COMMAND_RECEIPT_WINDOW_FULL` + `:action :resync-state` 拒绝**新** command-id，重放与 payload 冲突仍走原语义，轮换 epoch 后窗口清空。默认上限 4096，可由 gate 文档的 `:max-receipts` 覆盖。
 - **已关闭的部分（二）**：`:runs` 的终态正文重复存储已在 `c6cc6c4` 关闭。每条终态 run 的回答同时存在于 run 的 `:text` 与 `:conversation` 的 assistant 消息里，实测重复占整文档 16.2%（500 轮 155000 字符、1000 轮 310000 字符）。`state/collapse-run-text` 保留最新 `:run-text-window`（默认 64）条终态 run 的正文，更早的只留 `:text-length`。活跃 run 与 actor run 永不折叠：前者靠 `:text` 累积，后者的 `put-assistant` 故意跳过 conversation，run 记录是那份回答的唯一副本。
 - **已关闭的部分（三）**：`:calls` 的 request snapshot 冗余已在 `62293e0`、`9348cbb`、`6d06a29` 关闭。每条 model call 冻结整份出站消息窗口，终态后无任何读者读 `[:request :snapshot :messages]`。实测带 32 条 300 字符窗口时 100 轮文档 1 817 818 字符，其中 89% 是这些快照。既有 `hc.compose.owner.compact/compact-state` 早就能做这个外置，但只在 `commit-message!` 一处、由 `:compact-threshold`（生产配 1000000）开关式触发；那个开关本身要 `(count (pr-str state))` 全量序列化一次，且文档会锯齿——55 轮压到 137 296 后 45 轮又长回 954 108。现在改为每次 commit 都压缩（`compact-state` 幂等），并把 store 在 `start!` 处包一层 `store/compacting-store`，让 5 处 commit 路径全部受保护而不只是消息路径。另把 `max-preview-chars` 从 `max-inline-chars` 解耦成独立的 128：preview 在 `compact.clj` 外零读者，之前每条已结算 call 白扛 1 KiB。合计后 500 轮文档从 3 654 616 降到 1 027 816（省 72%）。
-- **剩余缺口（一）**：每个流式 chunk 仍逐条提交。`src/hc/compose/owner/dispatch.clj:301-312` 的 `deliver!` 对每个 provider 事件直接 `post!`，`state.clj:1002-1012` 的 `append-run-text` 每次追加都把整段文本重新 `str` 拼接并重写 assistant 消息。实测 2000 个 chunk 得到 14.9 KB 文本、33.9 KB 文档，写放大与 chunk 数成正比。
+- **已关闭的部分（四）**：流式 chunk 的逐条提交已在 `be56d33` 关闭。buffer 放在 Owner 状态（`(:stream-buffer ctx)`，永不进入已提交文档），门槛 192 字符或 240 ms；任一非 chunk 消息（terminal / cancel / tool-call / dispatch-failed）在转移前无条件折叠全部尾巴。实测 **2000 chunk / 20 000 字符 → 111 次提交（降 94.5%）**；取消路径保留 32 字符尾巴，`:text run` 与 `:text message` 一致。折叠永不移除文本，只有 `prune-stream-entry` 依据**已提交状态**（不是候选态）裁掉已被覆盖的前缀，因此 `:VERSION_CONFLICT` 重试会重算出同一段尾巴。发送侧完全不参与，`dispatch.clj` 未因此改动——这正是回避上一轮 flush 竞态的要点。
 - **剩余缺口（二）**：只剩 `:conversation` 本身仍随会话线性增长且无上限。`c6cc6c4` 折叠了 run 的重复正文，`62293e0`/`9348cbb`/`6d06a29` 外置了 call 的 request 快照，但每条消息的原文仍必须在 `:conversation` 内联——它不是重复副本，是唯一副本。合成 500 轮会话实测 33%（`:conversation` 占整文档三分之一）。发布侧的 `snapshot.clj:858-880` 每 tick 全量投影所有可见会话，见 D-50；那条路径只受 `:published-windows` 约束，不受 `history-window-size` 约束。
 - **已实测的当前水位**：500 轮会话在四处修复后共 1 027 816 字符，commit 5.48 ms（`2437e3b` 之前是 31.81 ms，因为 `compact-state` 为报 `:saved` 而做了两次全量 `pr-str`；加 `:measure? false` 后消除）。对照未修复的 3 654 616 字符，同会话省 72%、commit 快 5.8 倍。
 - **影响**：长会话的 Owner 整态 CAS 越来越慢；长流式回合放大持久层写。真实成本已实测：主力是 `hc.server.storage.migration/normalize` 的两次全量序列化——`migration.clj:180` 的 `(count (pr-str doc))` 约 36%，`migration.clj:146` 的 `(pr-str (canonical-form …))` + SHA-256 约 50%。LMDB `transact!` + `sync!` 只占 2.5%（`:nosync` 与 `:sync` 中位数几乎相同，fsync 不是瓶颈），提交后返回视图约 11%。线性拟合 `commit_ms = 2.99 + 0.0430 × turns`：20 ms 在约 400 轮越过，1 MiB 在约 2031 轮到达（那时约 89 ms）。中文载荷按 UTF-8 字节算 1 MiB 只需约 795 轮。**20 ms 阈值早已越过，且触发它的轮数远早于 1 MiB。**
@@ -20,7 +20,7 @@
 - **把 buffer 放进 Owner 状态也不是无条件的解**：`runtime.clj:398` 的 `commit-message!` 是一个 `loop`，在 `:VERSION_CONFLICT` 时 `reload!` 后 `recur`（`attempt < 8`，即同一 message 最多重放九次）。若 buffer 在 `apply-message` 内被 drain，则第一次尝试把它折进 candidate、提交撞 `:VERSION_CONFLICT`、`reload!` 把状态还原、buffer 已空；第二次尝试同一 chunk 再来时无内容可折，那段文本从最终回答里永久消失。今天的逐 chunk 追加没有这个洞，因为文本落在 `apply-message` 重算出的**不可变状态值**里。因此 Owner 侧 buffer 必须把 drain 绑定到**提交成功**，而不是绑定到 message 应用：`commit-message!` 读取 buffer、折进 candidate、提交，且只在 `:ok?` 时清空被折的条目。这是 D-37 剩余部分的设计前提，不是可选项。
 - **建议**：先把 buffer 放进 Owner 状态（每 attempt 一个 `:pending-chunk` 字段），由 Owner 在每次消息里合并，取消时由 Owner 自己 finalize——这样不存在发送侧与 Owner 的 flush 竞态；再为 `:conversation` 定义显式折叠策略（保留 reset 边界之后的权威消息与密封窗口所需的切片，把更早的已结算消息折叠为摘要并保留可追溯引用），同步更新 Pair-Hint 链与 sealed-view 的验收。
 - **实测：前缀归档也会打断探针**。取 200 条、50 个 reset beat 的对话，砍掉前 40 条后，`reset-0` 与 `reset-9` 在保留段里查不到（局部下标为 `-`），而 `reset-10` 起才有局部下标。故前缀归档同样不是「丢掉即可」——被归档段必须保持随机可读（每段一个 blob），否则 `sealed-scope-view` 对旧 beat 的查询会退化为 `:SEALED_VIEW_BOUNDARY_MISSING`。今天不出错只因为 `scope-admission-check` 强制 ask 指向 `(peek beats)`，那是行为保证，存储层无法强制。
-- **触发条件**：已满足并已处理 `:calls` 与 `:runs` 两部分。剩余 `:conversation` 本体在 500 轮约 313 KB；要让它真正有界，必须先锁死普查报告 §8 的五条前提（sealed view 回溯上界、归档 blob 的随机可读性、下标连续性方案、Pair-Hint 投影不变的证明、归档触发的可观测性）。在那之前，改动 `:conversation` 的存储形态会同时破坏 `:PREFIX_DRIFT` 与 sealed view 两个契约，风险高于收益。
+- **触发条件**：已满足并已处理 `:calls`、`:runs` 正文、以及 chunk 批量提交四部分。剩余 `:conversation` 本体在 500 轮约 313 KB（占整文档 33%，且 `:runs` 元数据另有 50%，见 D-49）；要让它真正有界，必须先锁死普查报告 §8 的五条前提（sealed view 回溯上界、归档 blob 的随机可读性、下标连续性方案、Pair-Hint 投影不变的证明、归档触发的可观测性）。在那之前，改动 `:conversation` 的存储形态会同时破坏 `:PREFIX_DRIFT` 与 sealed view 两个契约，风险高于收益。
 
 ## D-48 存储层 `normalize` 把同一文档序列化三次
 
@@ -52,20 +52,3 @@
 - **实测收益**：按「保留 `:run-id :call-id :attempt-id :status :finished-at :started-at :message-id :text :text-length`，并把 `:tool-call-ids` 压成一个 `:had-tools?` 布尔」模拟缩身，在 100/200/400/800 轮上稳定省下 `:runs` 区的 **60%**，即整文档的 **18%**。800 轮从 1 498 032 降到 1 227 052 字符（省 270 980）。已经过 `collapse-run-text` 的长会话同样省 60%（225 361 → 89 981）。这是 D-37 系列里单位收益最高的一刀，且不需要碰 `:conversation` 的任何契约。
 - **建议方向**：把终态 run 折叠为「身份 + 终态 + 时间 + 计数 + 是否有工具证据」的最小集，把 `:context` 与 `:tool-call-ids` 明细外置到 blob 区（与 `:calls` 的 `:request :snapshot` 同一机制）。保守估计可去掉 460 字符/条 中的大部分。**必须先跑完整读者普查**：本条目只做了静态阅读，`test/` 下对 `:runs` 的直接断言（`compact_test.clj:40`、`run_text_window_test.clj:41`、`attempt_id_normalization_test.clj:48`、`handlers_test.clj:1285`）会受影响，须逐个判定是锁行为还是锁字段。
 - **触发条件**：任何会话进入 300 轮以上；或单次提交观测到文档超过 400 KB。
-
-## D-50 发布侧每 tick 全量投影所有会话的 `:conversation`
-
-- **条款**：`AGENTS.md` §7.3（瘦客户端状态边界与 `STATE_SNAPSHOT`）与 §8.5 性能目标。
-- **缺口**：`snapshot/baseline`（`src/hc/server/app/snapshot.clj:789` 起）里存在**两条**投影路径，一条有窗口、一条没有，而它们最后被 `merge-with` 合并：
-  - `histories`（约 900-932 行）：走 `history-window-ids` + `:messages-window`，正确受 `history-window-size` 与 `inactive-history-window-size` 约束。
-  - `conversations`（约 858-880 行）：把每个可见会话的**完整** `:conversation` 经 `conversation-view` 全量投影，**不受任何窗口约束**。
-  - 最终 `base-by-id` 用 `(merge-with ...)` 把 `(:message/by-id messages)`（来自 `conversations`）与 `history-by-id` 合并。全量的 conversation 因此覆盖了窗口化的 history——窗口实际失效。
-  `test/hc/server/app/lazy_owner_test.clj:203` 的 `baseline-publishes-the-active-window-and-no-inactive-entities` 之所以通过，是因为它传 `:owner-snapshots {}`，`visible-owners` 为空，`conversations` 自然为空。一旦有 owner snapshot，全量路径就接管。**测试没有覆盖有 owner snapshot 的情形。**`inactive-history-window-size` 的 docstring 明写「Default to 0, so a large session list publishes no entities for sessions nobody opened」，但该意图只对 `:session-records` 生效。
-- **影响**：一个 500 轮会话在每次快照里都下发完整历史，即使客户端只打开一个会话；用户没打开的会话也全量下发。这与 §8.5 的「打开列表按需渲染」直接冲突。
-- **窗口化的已知陷阱**：`conversation-view` 经 `normalize-message` → `message-id` 计算每条消息的 id，最后一级回退是 `(str "message-" index)`，而 `index` 是**投影后向量里的位置**。一旦丢掉前缀，没有显式 id 的消息会整体改变 id；客户端看到的是身份全换而非增量追加，且 `:published-windows` 记录的旧 id 集合再也匹配不上，窗口逻辑会静默退化成「发布全部」。真实条目都带稳定 `:message-id`（`put-assistant` 写入 `"assistant-<call-id>-<attempt-id>"`），但该回退路径必须被证明不可达，或被改成保留原始下标。
-- **两条路径的数据源不同，不能简单删掉其中一条**：`conversations` 源自 `(:conversation state)`（活跃 Owner 会话的**在途**对话），`histories` 源自 `:session-records`（**已持久化**的会话记录）。前者携带尚未落盘的流式 assistant 消息，正是客户端在模型说话时要渲染的那条。删掉 `conversations` 会让流式回答从快照里消失。所以只能给它**加窗口**，不能移除。
-- **窗口必须在投影之前**：`conversation-view` 只在 `snapshot.clj:854`（带缓存分支）与 `:860`（无缓存分支）被调用，两处都走 `normalize-message` 的 `(str "message-" index)` 末级回退。因此要先把 `:conversation` 向量按 id 集合收窄**再**传入，不能对 `conversation-view` 的输出收窄——后者会重新生成 id。
-- **窗口还必须与 `histories` 一致**：`history-window-ids` 已能从 `published-windows` + `window-size` 算出某会话的 id 集合。直接复用它的结果过滤该会话的 conversation 条目，否则 merge 看到同一会话的两个不同尾巴，并集仍然错。
-- **缓存键要带上窗口**：`:854` 的缓存以 `(:version owner)` 为键，不含窗口。若在缓存调用前收窄，必须把窗口并进键，否则第一个发布者的窗口会永久生效。`history-window-key` 就是为这个存在，照抄即可。
-- **建议方向**：把两个窗口参数同样应用到 `conversations` 路径，并同步过滤 `:message/order`（客户端硬不变量：`:message/order` 必须恰好列出 `:message/by-id` 的全部键各一次，见 `src/hc/client/sync/AGENTS.md:230`）。窗口化必须保留原始下标，不能重排 `:conversation` 顺序。
-- **触发条件**：任何会话超过 `history-window-size`，或可见会话数超过 10。
