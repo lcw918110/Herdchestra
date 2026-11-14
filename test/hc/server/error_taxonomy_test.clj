@@ -402,7 +402,8 @@
                 _ (io/make-parents file)
                 _ (spit file "artifact")
                 svc (artifacts/service {:store store
-                                        :blob-root (str root "/blobs")})
+                                        :blob-root (str root "/blobs")
+                                        :workspace-root root})
                 error (with-redefs [storage/commit-migration!
                                     (fn [& _]
                                       (throw (ex-info

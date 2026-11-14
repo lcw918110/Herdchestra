@@ -68,7 +68,8 @@
   (let [dir (temp-dir)
         store (storage/open-store {:path (str dir "/db") :create? true})
         blob-root (str dir "/blobs")
-        svc (artifacts/service {:store store :blob-root blob-root})
+        svc (artifacts/service {:store store :blob-root blob-root
+                                  :workspace-root dir})
         file (str dir "/delivered.txt")]
     (try
       (spit file "交付内容\nsecond line\n")
@@ -139,7 +140,8 @@
   (let [dir (temp-dir)
         store (storage/open-store {:path (str dir "/db") :create? true})
         blob-root (str dir "/blobs")
-        svc (artifacts/service {:store store :blob-root blob-root})]
+        svc (artifacts/service {:store store :blob-root blob-root
+                                  :workspace-root dir})]
     (try
       (let [board (ready-board)
             runner (shell/runner {:root dir

@@ -1825,7 +1825,7 @@
 
 (def ^:private owner-broadcast-types
   "Owner advisory effects that must reach every AG-UI subscriber as CUSTOM."
-  #{:hc/ask :hc/ask-resolved :worker/program-result})
+  #{:hc/ask :hc/ask-resolved :worker/program-result :hc/artifact-undelivered})
 
 (defn- owner-event-name
   "Wire name of a namespaced Owner effect: `:hc/ask` -> `\"hc/ask\"`.
@@ -1858,6 +1858,53 @@
                         :thread-id session-id
                         :session-id (or (:session-id event) session-id))})
         (catch Throwable _ nil)))))
+
+(defn- register-terminal-artifact!
+  "Register the artifact an executor terminal produced, or report why not.
+
+  §7.2: bytes the executor wrote are already in the workspace, so a refused
+  registration is a delivery gap, not a log detail.  The artifact component
+  queues the request for `retry-pending!` and exposes the diagnostic in its
+  snapshot; this also broadcasts `hc/artifact-undelivered` through the same
+  CUSTOM channel artifact cards use, so the operator sees that a file exists
+  without an artifact card.
+
+  Returns `{:ok? true :artifact ...}` on success, or
+  `{:ok? false :diagnostic ...}` when registration or announcement failed.
+  A terminal with no artifact returns nil."
+  [component terminal system-ref config notify-ref]
+  (when (and component terminal)
+    (let [request {:session-id (:session-id terminal)
+                   :task-id (:task-id terminal)
+                   :call-id (:tool-call-id terminal)
+                   :executor (:name terminal)
+                   :result (:result terminal)
+                   :workspace-root (:workspace-root config)
+                   ;; The notifier only marks the publisher dirty; it cannot
+                   ;; confirm the event reached a live subscriber.  Acceptance
+                   ;; is judged by `register-and-announce!`, so an unaccepted
+                   ;; publish leaves the artifact unannounced for the retry
+                   ;; queue instead of claiming success.
+                   :publish! (fn [_]
+                               (when-let [f @notify-ref] (f))
+                               true)}]
+      (try
+        (artifacts-integration/register-executor-result! component request)
+        (catch Throwable t
+          (let [diagnostic (or (:artifact-diagnostic (ex-data t))
+                               (artifacts-integration/registration-diagnostic
+                                request t))]
+            (when-let [gw (:gateway @system-ref)]
+              (try
+                (gateway/broadcast!
+                 gw
+                 {:type "CUSTOM"
+                  :name "hc/artifact-undelivered"
+                  :value (assoc diagnostic
+                                :thread-id (:session-id terminal)
+                                :session-id (:session-id terminal))})
+                (catch Throwable _ nil)))
+            {:ok? false :diagnostic diagnostic}))))))
 
 (defn- applied-compression-set
   "The session context's `:applied` compression records in id order, plus a
@@ -2535,53 +2582,8 @@
                                         :temporary? (:temporary? session)}
                                        terminal))))
                          (catch Throwable _ nil))
-                       (try
-                         (when-let [a @artifacts-ref]
-                           (artifacts-integration/register-executor-result!
-                            a
-                            {:session-id (:session-id terminal)
-                             :task-id (:task-id terminal)
-                             :call-id (:tool-call-id terminal)
-                             :executor (:name terminal)
-                             :result (:result terminal)
-                             :workspace-root (:workspace-root config)
-                             ;; The notifier only marks the publisher dirty;
-                             ;; it cannot confirm the event reached a live
-                             ;; subscriber.  Announce acceptance is judged by
-                             ;; `register-and-announce!`, and an unaccepted
-                             ;; publish leaves the artifact unannounced for
-                             ;; the retry queue instead of claiming success.
-                             :publish! (fn [_]
-                                         (when-let [f @notify-ref] (f))
-                                         true)}))
-                         (catch Throwable t
-                           ;; The file may already exist in the workspace.
-                           ;; Swallowing this left the user with no card and
-                           ;; no way to find the cause.  The artifact
-                           ;; component keeps the failed request for a retry
-                           ;; and exposes the diagnostic in its snapshot; the
-                           ;; same event is broadcast so the operator sees
-                           ;; that an artifact was not registered.
-                           (let [diagnostic (or (:artifact-diagnostic
-                                                 (ex-data t))
-                                                (artifacts-integration/registration-diagnostic
-                                                 {:session-id (:session-id terminal)
-                                                  :task-id (:task-id terminal)
-                                                  :call-id (:tool-call-id terminal)
-                                                  :executor (:name terminal)
-                                                  :result (:result terminal)
-                                                  :workspace-root (:workspace-root config)}
-                                                 t))]
-                             (when-let [gw (:gateway @system-ref)]
-                               (try
-                                 (gateway/broadcast!
-                                  gw
-                                  {:type "CUSTOM"
-                                   :name "hc/artifact-undelivered"
-                                   :value (assoc diagnostic
-                                                 :thread-id session-id
-                                                 :session-id session-id)})
-                                 (catch Throwable _ nil)))))))
+                       (register-terminal-artifact!
+                        @artifacts-ref terminal system-ref config notify-ref))
                     :mission-port mission-port
                     :tool-result-renderer
                     program/render-tool-result

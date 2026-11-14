@@ -5,12 +5,16 @@
   that map has no feed, the broadcast threw, and the catch hid it.  A real
   S1 ask parked on the server while the browser saw nothing.  These tests
   hold the forwarder to the real gateway resolved from the system map."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [hc.compose.owner :as owner]
             [hc.compose.owner.state :as state]
             [hc.server.app.system :as system]
+            [hc.server.artifacts.integration :as integration]
             [hc.server.gateway :as gateway]
-            [hc.server.gateway.feed :as feed]))
+            [hc.server.gateway.feed :as feed]
+            [hc.server.storage :as storage]
+            [hc.server.storage.support :as support]))
 
 (defn- test-gateway
   []
@@ -135,3 +139,53 @@
         (is (= "ask-forward" (get-in custom [:value :thread-id]))))
       (finally
         ((:stop! handle))))))
+
+(deftest artifact-registration-failure-is-broadcast-not-swallowed
+  ;; D-34: the executor already wrote the file, so a refused registration
+  ;; used to leave the user with no card and no explanation.  The handler
+  ;; must keep the diagnostic queryable and broadcast it on the same channel
+  ;; artifact cards use.
+  (let [dir (str (java.nio.file.Files/createTempDirectory
+                  "hc-artifact-d34-"
+                  (make-array java.nio.file.attribute.FileAttribute 0)))
+        store (storage/open-store {:path (str dir "/db") :create? true})
+        component (integration/attach {:store store
+                                       :blob-root (str dir "/blobs")
+                                       :config {:workspace-root (str dir "/ws")}})
+        gw (test-gateway)
+        system-ref (atom {:gateway gw})
+        notify-ref (atom nil)
+        terminal {:session-id "d34"
+                  :task-id "task-1"
+                  :tool-call-id "call-d34"
+                  :name :shell
+                  :result {:output {:artifact
+                                    {:path (str dir "/escaped.log")}}}}]
+    (try
+      (.mkdirs (java.io.File. ^String (str dir "/ws")))
+      (spit (str dir "/escaped.log") "outside the workspace\n")
+      (let [outcome (#'system/register-terminal-artifact!
+                     component terminal system-ref
+                     {:workspace-root (str dir "/ws")} notify-ref)]
+        (is (false? (:ok? outcome)))
+        (is (= :ARTIFACT_OUTSIDE_WORKSPACE
+               (get-in outcome [:diagnostic :code])))
+        (is (= "call-d34" (get-in outcome [:diagnostic :tool-call-id])))
+        (is (str/ends-with? (get-in outcome [:diagnostic :path])
+                            "escaped.log"))
+        (is (some? (get-in outcome [:diagnostic :message])))
+        (testing "the failure is queryable from the component"
+          (is (= (get-in outcome [:diagnostic]) ((:last-error component)))))
+        (testing "the user-visible event reaches the AG-UI feed"
+          (is (wait-for #(seq @(:events gw)) 3000)
+              (pr-str @(:events gw)))
+          (let [custom (first (filter #(= "hc/artifact-undelivered" (:name %))
+                                      @(:events gw)))]
+            (is (some? custom))
+            (is (= "d34" (get-in custom [:value :session-id])))
+            (is (= :ARTIFACT_OUTSIDE_WORKSPACE
+                   (get-in custom [:value :code])))
+            (is (= "call-d34" (get-in custom [:value :tool-call-id]))))))
+      (finally
+        (try (storage/close-store! store) (catch Throwable _ nil))
+        (support/delete-tree! dir)))))
