@@ -607,15 +607,33 @@
     (:plan-worker :dedicated-worker :worker :holder :task) :task
     :main))
 
+(defn- id-spelling
+  "The identity text of one configuration id.
+
+  Settings documents store ids as strings, but a request snapshot or an older
+  binding may carry the same identity as a keyword.  `(str :conn-a)` is
+  `\":conn-a\"`, so a plain `str` comparison would treat the keyword and the
+  string as different entries — which is what the docstring below promises it
+  does *not* do.
+
+  Only the leading colon is notation.  A namespaced keyword keeps its
+  namespace, because `:a/b` and `:b` are different identities."
+  [value]
+  (let [text (str value)]
+    (if (and (keyword? value) (str/starts-with? text ":"))
+      (subs text 1)
+      text)))
+
 (defn- same-id?
   "True when two configuration identities name the same entry.
 
   Settings documents store connection and model ids as strings.  A request
-  snapshot or an older binding may carry the same identity as a keyword."
+  snapshot or an older binding may carry the same identity as a keyword, so
+  the comparison is on the spelling without the leading colon."
   [left right]
   (and (some? left)
        (some? right)
-       (= (str left) (str right))))
+       (= (id-spelling left) (id-spelling right))))
 
 (defn- entry-id
   "Return the stable id of one connection or model entry."

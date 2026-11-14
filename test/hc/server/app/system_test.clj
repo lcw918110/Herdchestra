@@ -1109,11 +1109,15 @@
       (is (true? (same-id? :conn-a :conn-a)))
       (is (true? (same-id? 7 "7"))
           "the printed form, not the type, decides equality"))
-    (testing "a keyword spelling and a string spelling differ by the colon"
-      (is (false? (same-id? :conn-a "conn-a")))
-      (is (false? (same-id? "conn-a" :conn-a)))
-      (is (true? (same-id? :conn-a ":conn-a"))
-          "this is what the two spellings have to look like to match"))
+    (testing "a keyword and a string spelling name the same entry"
+      ;; The docstring promises this: a snapshot may carry `:conn-a` where
+      ;; settings store `"conn-a"`.  `(str :conn-a)` is `":conn-a"`, so the
+      ;; old `(= (str left) (str right))` silently refused the keyword form
+      ;; and the send gate then ignored the declared capability.
+      (is (true? (same-id? :conn-a "conn-a")))
+      (is (true? (same-id? "conn-a" :conn-a)))
+      (is (false? (same-id? :conn-a ":conn-a"))
+          "the colon is notation, not part of the identity"))
     (testing "different identities do not match"
       (is (false? (same-id? "conn-a" "conn-b")))
       (is (false? (same-id? :conn-a :conn-b))))
@@ -1184,25 +1188,28 @@
       (is (nil? (matching-entry "conn-a" "conn-a"))
           "a scalar is not an entry collection"))))
 
-(deftest an-entry-id-spelling-is-not-unified-with-its-keyword-form
-  ;; The `same-id?` docstring says a keyword identity and its string spelling
-  ;; name the same entry, but the predicate compares `(str left)` with
-  ;; `(str right)`, and `(str :conn-a)` is ":conn-a".  A vector entry that
-  ;; carries only `:id "conn-a"` is therefore invisible to a keyword request.
-  ;; This test pins the behavior that exists today; if the spellings are ever
-  ;; unified, these assertions must be inverted rather than deleted, because
-  ;; that is the moment the send gate starts accepting keyword bindings.
+(deftest an-entry-id-spelling-matches-its-keyword-form
+  ;; The `same-id?` docstring promised that a keyword identity and its string
+  ;; spelling name the same entry, but the predicate compared `(str left)`
+  ;; with `(str right)` and `(str :conn-a)` is ":conn-a".  A vector entry
+  ;; carrying `:id "conn-a"` was therefore invisible to a keyword request, and
+  ;; the send gate silently ignored the declared capability.  Only the colon
+  ;; is notation; a namespace stays part of the identity.
   (let [same-id? (matcher 'same-id?)
         matching-entry (matcher 'matching-entry)
         entries [{:id "conn-a"}]]
-    (is (false? (same-id? :conn-a "conn-a"))
-        "a keyword prints with its colon, so the string forms differ")
-    (is (true? (same-id? :conn-a ":conn-a"))
-        "the colon spelling is what the comparison actually matches")
-    (is (nil? (matching-entry entries :conn-a))
-        "a keyword id does not reach a string-keyed vector entry")
+    (is (true? (same-id? :conn-a "conn-a"))
+        "the colon is notation, not part of the identity")
+    (is (true? (same-id? "conn-a" :conn-a)))
+    (is (false? (same-id? :conn-a ":conn-a"))
+        "a literal colon in a string is a different identity")
+    (is (false? (same-id? :a/conn "a-conn"))
+        "a namespaced keyword keeps its namespace")
+    (is (true? (same-id? :a/conn "a/conn")))
+    (is (= {:id "conn-a"} (matching-entry entries :conn-a))
+        "a keyword id reaches a string-keyed vector entry")
     (is (= {:id "conn-a"} (matching-entry entries "conn-a"))
-        "the string id, which settings documents store, does reach it")))
+        "the string id, which settings documents store, still reaches it")))
 
 (deftest current-tools-fact-reads-a-vector-shaped-settings-document
   ;; This is the regression the three helpers exist for.  A committed settings
