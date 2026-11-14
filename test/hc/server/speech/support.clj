@@ -230,3 +230,90 @@
            (System/arraycopy header 0 all 0 44)
            (System/arraycopy data 0 all 44 data-length)
            all)))))
+
+;; ---------------------------------------------------------------------------
+;; WebM / EBML
+
+(defn- ebml-id-bytes
+  "Encode an EBML element ID as the bytes it is written as.
+
+  IDs are recorded with their marker bit intact, so the width is read back
+  from the value rather than passed in."
+  [id]
+  (let [width (cond
+                (<= id 0xFF) 1
+                (<= id 0xFFFF) 2
+                (<= id 0xFFFFFF) 3
+                :else 4)]
+    (mapv (fn [i]
+            (bit-and (bit-shift-right (long id) (* 8 (- width 1 i))) 0xff))
+          (range width))))
+
+(defn- ebml-size-bytes
+  "Encode SIZE as an EBML variable-length size using WIDTH bytes."
+  [size width]
+  (let [marker (bit-shift-left 1 (* 7 width))
+        value (bit-or (long marker) (long size))]
+    (mapv (fn [i]
+            (bit-and (bit-shift-right value (* 8 (- width 1 i))) 0xff))
+          (range width))))
+
+(defn- ebml-uint-bytes
+  "Encode VALUE as a big-endian unsigned integer of WIDTH bytes."
+  [value width]
+  (mapv (fn [i]
+          (bit-and (bit-shift-right (long value) (* 8 (- width 1 i))) 0xff))
+        (range width)))
+
+(defn- ebml-float-bytes
+  "Encode VALUE as a big-endian IEEE-754 double (8 bytes)."
+  [value]
+  (let [bits (Double/doubleToLongBits (double value))]
+    (mapv (fn [i]
+            (bit-and (bit-shift-right bits (* 8 (- 7 i))) 0xff))
+          (range 8))))
+
+(defn- ebml-element
+  "One EBML element with the smallest size width that fits."
+  [id payload]
+  (let [size (count payload)
+        width (loop [w 1]
+                (if (or (>= w 8) (< size (dec (bit-shift-left 1 (* 7 w)))))
+                  w
+                  (recur (inc w))))]
+    (vec (concat (ebml-id-bytes id)
+                 (ebml-size-bytes size width)
+                 payload))))
+
+(defn webm-bytes
+  "Return a minimal WebM/EBML byte array that declares DURATION-MS.
+
+  This is the shape a browser MediaRecorder produces: an EBML header, then a
+  Segment wrapping an Info element with TimecodeScale and Duration.  It is not
+  playable audio; it exists so the duration check can be exercised without a
+  real recorder."
+  ([duration-ms] (webm-bytes duration-ms 1000000))
+  ([duration-ms timecode-scale]
+   (let [header (ebml-element 0x1A45DFA3
+                              (ebml-element 0x4286 (ebml-uint-bytes 1 1))) ; EBMLVersion
+         info (ebml-element 0x1549A966
+                            (vec (concat
+                                  ;; TimecodeScale: nanoseconds per unit
+                                  (ebml-element 0x2AD7B1
+                                                (ebml-uint-bytes timecode-scale 4))
+                                  ;; Duration: in TimecodeScale units
+                                  (ebml-element 0x4489
+                                                (ebml-float-bytes
+                                                 (/ (* (double duration-ms) 1e6)
+                                                    (double timecode-scale)))))))
+         segment (ebml-element 0x18538067 info)]
+     (byte-array (map unchecked-byte (vec (concat header segment)))))))
+
+(defn ebml-header-bytes
+  "Return only the EBML header element, with no Segment.
+
+  Used to prove that a WebM-shaped payload without a Segment > Info Duration
+  stays unverifiable instead of being guessed from the header alone."
+  []
+  (ebml-element 0x1A45DFA3
+                (ebml-element 0x4286 (ebml-uint-bytes 1 1))))
