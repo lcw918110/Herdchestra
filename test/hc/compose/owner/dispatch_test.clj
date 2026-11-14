@@ -1,6 +1,8 @@
 (ns hc.compose.owner.dispatch-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [hc.compose.owner.dispatch :as dispatch]))
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [hc.compose.owner.dispatch :as dispatch]
+            [hc.compose.owner.mailbox :as mailbox]))
 
 (defn- wait-for
   [pred timeout-ms]
@@ -319,5 +321,142 @@
                                          :call-id "c1"})
                      [:error :code])))
       (is (= :failed (:status (first (messages-with messages :call/terminal)))))
+      (finally
+        (dispatch/stop! d)))))
+
+(defn- model-gateway-that-delivers
+  "Return a gateway that pushes EVENTS through `deliver!` at start time.
+
+  The delivered results are kept in an atom, because `deliver!` returns the
+  post result and its shape is what callers see."
+  [events results]
+  {:start! (fn [request deliver!]
+             (doseq [event events]
+               (swap! results conj (deliver! event)))
+             {:attempt-id (:attempt-id request)})
+   :cancel! (fn [_] nil)})
+
+(deftest refused-chunk-records-its-call-and-flags-incomplete-text
+  (let [box (mailbox/create {:id "drop-chunk" :capacity 1
+                             :handler (fn [_] nil)})
+        results (atom [])
+        d (dispatch/create
+           {:post! (fn [message] (mailbox/submit! box message))
+            :model-gateway
+            (model-gateway-that-delivers
+             (mapv (fn [n] {:event :chunk :text (str "t" n)}) (range 5))
+             results)})]
+    (try
+      (is (:ok? (dispatch/start! d {:kind :model :attempt-id "a1"
+                                    :call-id "c1"
+                                    :request {:snapshot {:messages []}}})))
+      (is (= [true false false false false] (mapv :ok? @results))
+          "the first chunk fits the queue and every later chunk is refused")
+      (is (every? :dropped? (rest @results))
+          "a refusal is visible in the post result itself")
+      (let [report (dispatch/drop-report d)]
+        (is (= 4 (:total report)))
+        (is (= {:chunk 4} (:by-type report))
+            "a refused model event counts as its event kind")
+        (is (true? (get-in report [:chunks :incomplete?])))
+        (is (= :CHUNK_DROPPED (get-in report [:chunks :code])))
+        (is (= 4 (get-in report [:chunks :count])))
+        (is (= ["c1"] (get-in report [:chunks :call-ids]))
+            "an operator can find the call whose text is now incomplete")
+        (is (= ["a1"] (get-in report [:chunks :attempt-ids])))
+        (is (= [] (get-in report [:chunks :agent-ids]))
+            "the drop record carries agent ids only when the message has one")
+        (is (str/includes? (get-in report [:chunks :message]) "incomplete"))
+        (is (every? :incomplete-output? (:recent report)))
+        (is (every? #(= "c1" (:call-id %)) (:recent report)))
+        (is (every? #(= :MAILBOX_FULL (:error-code %)) (:recent report)))
+        (is (= 4 (:dropped (dispatch/stats d))))
+        (is (= 4 (:chunk-dropped (dispatch/stats d)))))
+      (finally
+        (mailbox/stop! box)
+        (dispatch/stop! d)))))
+
+(deftest drop-record-is-bounded-while-the-total-stays-exact
+  (let [results (atom [])
+        d (dispatch/create
+           {:post! (fn [_message]
+                     {:ok? false :error {:code :MAILBOX_FULL}})
+            :model-gateway
+            (model-gateway-that-delivers
+             (mapv (fn [_] {:event :chunk :text "x"}) (range 100))
+             results)})]
+    (try
+      (dispatch/start! d {:kind :model :attempt-id "a1"
+                          :call-id "c1"
+                          :request {:snapshot {:messages []}}})
+      (let [report (dispatch/drop-report d)]
+        (is (= 100 (:total report)) "the total counts every refusal")
+        (is (= 100 (get-in report [:chunks :count])))
+        (is (= {:chunk 100} (:by-type report))
+            "a full detail record must not fold a counted kind into :other")
+        (is (= ["c1"] (get-in report [:chunks :call-ids])))
+        (is (= dispatch/drop-log-limit (:recent-count report))
+            "the detailed record stops at its bound")
+        (is (= dispatch/drop-log-limit (count (:recent report))))
+        (is (= 100 (:dropped (dispatch/stats d))))
+        (is (= 100 (:chunk-dropped (dispatch/stats d)))))
+      (is (= 4 (:recent-count (dispatch/drop-report d {:recent-limit 4})))
+          "a reader can ask for fewer records without changing the total")
+      (is (str/includes? (get-in (dispatch/drop-report d) [:chunks :message])
+                         "call c1")
+          "the alarm names the affected call in words")
+      (finally
+        (dispatch/stop! d)))))
+
+(deftest by-type-separates-a-lost-chunk-from-a-lost-terminal
+  (let [events [{:event :chunk :text "a"}
+                {:event :completed :text "a"}
+                {:event :chunk :text "b"}]
+        d (dispatch/create
+           {:post! (fn [_message]
+                     {:ok? false :error {:code :MAILBOX_FULL}})
+            :model-gateway
+            (model-gateway-that-delivers events (atom []) )})]
+    (try
+      (dispatch/start! d {:kind :model :attempt-id "a1"
+                          :call-id "c1"
+                          :request {:snapshot {:messages []}}})
+      (let [report (dispatch/drop-report d)
+            by-type (:by-type report)]
+        (is (= 2 (get-in by-type [:chunk]))
+            "a lost chunk is counted as a chunk, not as a model event")
+        (is (= 1 (get-in by-type [:completed]))
+            "a lost terminal stays distinct from a lost chunk")
+        (is (= 1 (get-in by-type [:dispatch/settled]))
+            "an envelope without an inner event keeps its own kind")
+        (is (= 2 (get-in report [:chunks :count]))
+            "only the chunks belong to the text-incompleteness alarm")
+        (is (= :CHUNK_DROPPED (get-in report [:chunks :code])))
+        (is (= 4 (:total report))
+            "three model events and one lifecycle message were refused"))
+      (finally
+        (dispatch/stop! d)))))
+
+(deftest type-bound-never-hides-a-chunk
+  (let [d (dispatch/create {:post! (fn [_] {:ok? true})})
+        ;; `record-drop!` is private; `ns-resolve` reaches it without
+        ;; widening the public surface.
+        record! (deref (ns-resolve 'hc.compose.owner.dispatch 'record-drop!))
+        failure {:error {:code :MAILBOX_FULL}}]
+    (try
+      ;; Fill the distinct-type bound with kinds the dispatcher never posts,
+      ;; then refuse a chunk.  The chunk key must stay exact.
+      (doseq [n (range 20)]
+        (record! d {:type (keyword (str "synthetic-" n))} failure))
+      (record! d {:type :model/event :event {:event :chunk}}
+               failure)
+      (let [report (dispatch/drop-report d)]
+        (is (= 1 (get-in report [:by-type :chunk]))
+            "the alarm kind keeps its own key past the type bound")
+        (is (= 21 (:total report)) "every refusal still counts")
+        (is (<= (count (:by-type report)) 18)
+            "the distinct-key record stays bounded")
+        (is (true? (get-in report [:chunks :incomplete?])))
+        (is (= 1 (get-in report [:chunks :count]))))
       (finally
         (dispatch/stop! d)))))

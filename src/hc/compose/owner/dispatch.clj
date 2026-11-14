@@ -15,6 +15,11 @@
   FileChannel writer.  Late results stay diagnostic: the Owner rejects any
   terminal whose attempt id is no longer current.
 
+  The `:post!` target is bounded, so it can refuse a message.  A refusal is
+  never retried: a retry reorders the event stream and a blocking wait stalls
+  the caller.  `drop-report` keeps what was lost instead, so a refusal stays
+  visible to a health layer.
+
   The namespace depends on Missionary and Clojure only.  It does not require
   hc.server.*.  The model gateway and report sink are injected functions, so
   the composition layer never reaches into a server adapter."
@@ -151,6 +156,169 @@
         true
         (assoc :category :permanent)))))
 
+;; ---------------------------------------------------------------------------
+;; Refused-message record
+;;
+;; The post target is normally the Owner mailbox, and that mailbox is bounded.
+;; A refusal is backpressure, not an error the dispatcher can repair: a retry
+;; reorders the event stream, and a blocking wait stalls the caller.  The
+;; dispatcher therefore keeps what was lost, so an operator can see it.
+
+(def drop-log-limit
+  "Number of drop records kept in `drop-report` `:recent`.
+  The counters stay exact above this bound."
+  8)
+
+(def ^:private drop-type-limit
+  "Bound on distinct `:by-type` keys.  Types past this bound count under
+  `:other`, so a hostile message cannot grow the record."
+  16)
+
+(defn- message-kind
+  "The kind a reader cares about.
+
+  A model event is reported by its event keyword, so a refused chunk is
+  counted as `:chunk`, not as the envelope type `:model/event`."
+  [message]
+  (let [outer (:type message)
+        event (get-in message [:event :event])]
+    (cond
+      (and (= :model/event outer) (keyword? event)) event
+      (keyword? outer) outer
+      :else :other)))
+
+(defn- chunk-message?
+  "True when a refused message carries streamed text.
+
+  A refused chunk is the one case that changes the answer the user sees: the
+  text never reaches the run, and no later message restores it."
+  [message]
+  (= :chunk (message-kind message)))
+
+(defn- drop-identity
+  "Read the kind and owner of MESSAGE without depending on its shape."
+  [message]
+  {:type (message-kind message)
+   :call-id (or (:call-id message)
+                (get-in message [:event :call-id])
+                (get-in message [:event :model-call-id]))
+   :attempt-id (or (:attempt-id message)
+                   (get-in message [:event :attempt-id]))
+   :agent-id (:agent-id message)
+   :report-id (:report-id message)})
+
+(defn- bounded-conj
+  "Append ENTRY and keep at most LIMIT of the newest entries."
+  [entries entry limit]
+  (let [entries (conj (vec entries) entry)]
+    (if (> (count entries) limit)
+      (subvec entries (- (count entries) limit))
+      entries)))
+
+(defn- bounded-distinct-conj
+  [ids id limit]
+  (cond
+    (nil? id) ids
+    (some #{id} ids) ids
+    :else (let [ids (conj (vec ids) id)]
+            (if (> (count ids) limit)
+              (subvec ids (- (count ids) limit))
+              ids))))
+
+(defn- record-drop!
+  "Record one refused message and return the new exact total.
+
+  `:dropped` owns the exact total.  The details in `:drop-log` are bounded,
+  because a full mailbox can refuse without limit."
+  [dispatcher message result]
+  (let [total (.incrementAndGet ^AtomicLong (:dropped dispatcher))
+        identity (drop-identity message)
+        chunk? (chunk-message? message)
+        entry (assoc identity
+                     :at ((:clock dispatcher))
+                     :error-code (get-in result [:error :code])
+                     :incomplete-output? chunk?)]
+    (swap! (:drop-log dispatcher)
+           (fn [log]
+             (let [known? (contains? (:by-type log) (:type identity))
+                   ;; `:chunk` always keeps its own key: it is the alarm
+                   ;; kind, so the type bound must never fold it into
+                   ;; `:other`.
+                   room? (or known?
+                             (= :chunk (:type identity))
+                             (< (count (:by-type log)) drop-type-limit))
+                   type-key (if room? (:type identity) :other)
+                   log (-> log
+                           (update-in [:by-type type-key] (fnil inc 0))
+                           (assoc :recent
+                                  (bounded-conj (:recent log) entry
+                                                drop-log-limit)))]
+               (if chunk?
+                 (let [chunks (:chunks log)]
+                   (assoc log :chunks
+                          {:count (inc (long (:count chunks 0)))
+                           :call-ids
+                           (bounded-distinct-conj (:call-ids chunks)
+                                                  (:call-id identity)
+                                                  drop-log-limit)
+                           :attempt-ids
+                           (bounded-distinct-conj (:attempt-ids chunks)
+                                                  (:attempt-id identity)
+                                                  drop-log-limit)
+                           :agent-ids
+                           (bounded-distinct-conj (:agent-ids chunks)
+                                                  (:agent-id identity)
+                                                  drop-log-limit)}))
+                 log))))
+    total))
+
+(defn drop-report
+  "Return the bounded record of messages the post target refused.
+
+  Options:
+
+    :recent-limit  number of newest records to return; default
+                   `drop-log-limit`, and never more than that is kept
+
+  `:total` counts every refusal and never shrinks.  `:by-type` counts per
+  message kind: a `:model/event` envelope is counted by its inner event, so
+  a lost `:chunk` stays separate from a lost `:completed`.  Kinds past the
+  internal bound count under `:other`, except `:chunk`, which always keeps
+  its own key.
+
+  `:chunks` is the alarm for streamed text.  When `:incomplete?` is true, at
+  least one `:chunk` never reached the Owner, so the run text of every call
+  in `:call-ids` can never be complete: no later message restores text that
+  was never accepted.  The dispatcher does not choose who hears this.  The
+  map is the fact that a health or alarm layer reads."
+  ([dispatcher] (drop-report dispatcher nil))
+  ([dispatcher {:keys [recent-limit] :or {recent-limit drop-log-limit}}]
+   (let [log @(:drop-log dispatcher)
+         chunks (:chunks log)
+         chunk-count (long (:count chunks 0))
+         recent (:recent log)
+         limit (long (max 0 recent-limit))
+         recent (if (> (count recent) limit)
+                  (subvec recent (- (count recent) limit))
+                  recent)]
+     {:total (.get ^AtomicLong (:dropped dispatcher))
+      :recent-count (count recent)
+      :recent-limit drop-log-limit
+      :by-type (:by-type log)
+      :chunks {:count chunk-count
+               :incomplete? (pos? chunk-count)
+               :code (when (pos? chunk-count) :CHUNK_DROPPED)
+               :message (when (pos? chunk-count)
+                          (str "streamed text is incomplete for call "
+                               (or (first (:call-ids chunks)) "unknown")
+                               ": " chunk-count
+                               " chunk message(s) never reached the Owner"
+                               ", so no later message can restore them"))
+               :call-ids (:call-ids chunks)
+               :attempt-ids (:attempt-ids chunks)
+               :agent-ids (:agent-ids chunks)}
+      :recent recent})))
+
 (defn create
   "Create a dispatcher.
 
@@ -173,6 +341,11 @@
                     :kind is the executor kind, not the cancellation node kind
     :clock          `(fn [] epoch-ms)`, default `System/currentTimeMillis`
     :scheduler      optional ScheduledExecutorService for timers
+
+  A message that the post target refuses is counted in `:dropped` and
+  described by `drop-report`.  The dispatcher does not retry it: a retry
+  reorders the event stream, and a blocking wait stalls the provider thread.
+  What was lost must stay visible instead.
 
   A synchronous start failure is posted as a terminal failure for the
   claimed attempt, so the Owner never waits for a task that never started."
@@ -201,15 +374,25 @@
      :tasks (atom {})
      :timers (atom {})
      :dropped (AtomicLong. 0)
+     :drop-log (atom {:by-type {}
+                      :chunks {:count 0 :call-ids [] :attempt-ids []
+                               :agent-ids []}
+                      :recent []})
      :started (AtomicLong. 0)
      :settled (AtomicLong. 0)}))
 
 (defn- post!
+  "Post MESSAGE to the Owner mailbox.
+
+  A refusal is recorded, never retried.  The result stays `:ok? false` for
+  the caller and gains the drop markers, so a refusal is visible at both
+  ends."
   [dispatcher message]
   (let [result ((:post! dispatcher) message)]
-    (when (false? (:ok? result))
-      (.incrementAndGet ^AtomicLong (:dropped dispatcher)))
-    result))
+    (if (false? (:ok? result))
+      (let [total (record-drop! dispatcher message result)]
+        (assoc result :dropped? true :dropped-total total))
+      result)))
 
 (defn- settle!
   [dispatcher attempt-id]
@@ -914,10 +1097,17 @@
       :reason reason})))
 
 (defn stats
+  "Return the dispatcher counters.
+
+  `:dropped` counts every message the post target refused.  `:chunk-dropped`
+  counts the subset that carried streamed text: when it is positive, some
+  published answer is missing text.  `drop-report` returns the identities
+  and the recent records behind that count."
   [dispatcher]
   {:live (count @(:tasks dispatcher))
    :timers (count @(:timers dispatcher))
    :started (.get ^AtomicLong (:started dispatcher))
    :settled (.get ^AtomicLong (:settled dispatcher))
    :dropped (.get ^AtomicLong (:dropped dispatcher))
+   :chunk-dropped (long (:count (:chunks @(:drop-log dispatcher)) 0))
    :closed? @(:closed? dispatcher)})
