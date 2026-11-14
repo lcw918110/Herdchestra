@@ -16,6 +16,8 @@
             [hc.server.backup.maintenance-journal :as journal]
             [hc.server.blob-store.refs :as blob-refs]
             [hc.server.gateway :as gateway]
+            [hc.server.gateway.feed :as feed]
+            [hc.server.gateway.sync-object :as sync-object]
             [hc.server.history.snapshot :as history-snapshot]
             [hc.server.model-adapter :as model-adapter]
             [hc.server.sessions :as sessions]
@@ -1085,3 +1087,269 @@
     (component "session-b")
     (is (= 2 (count @built))
         "an unchanged revision and session reuses the value")))
+
+;; ---------------------------------------------------------------------------
+;; configuration entry lookup
+
+(defn- matcher
+  "Return the private matcher named SYM from `hc.server.app.system`."
+  [sym]
+  (var-get (ns-resolve 'hc.server.app.system sym)))
+
+(deftest same-id-compares-the-printed-form-without-coercing-spellings
+  ;; `same-id?` is the identity test under both `matching-entry` branches.  It
+  ;; compares `(str left)` with `(str right)` and refuses nil, which makes the
+  ;; printed form the identity: two equal spellings match, and two different
+  ;; spellings do not.  The nil guard is the part that matters for the map
+  ;; branch, where a value without any id field would otherwise match a missing
+  ;; wanted-id.
+  (let [same-id? (matcher 'same-id?)]
+    (testing "the same spelling is the same identity"
+      (is (true? (same-id? "conn-a" "conn-a")))
+      (is (true? (same-id? :conn-a :conn-a)))
+      (is (true? (same-id? 7 "7"))
+          "the printed form, not the type, decides equality"))
+    (testing "a keyword spelling and a string spelling differ by the colon"
+      (is (false? (same-id? :conn-a "conn-a")))
+      (is (false? (same-id? "conn-a" :conn-a)))
+      (is (true? (same-id? :conn-a ":conn-a"))
+          "this is what the two spellings have to look like to match"))
+    (testing "different identities do not match"
+      (is (false? (same-id? "conn-a" "conn-b")))
+      (is (false? (same-id? :conn-a :conn-b))))
+    (testing "an absent identity never matches, including two absences"
+      (is (false? (same-id? nil "conn-a")))
+      (is (false? (same-id? "conn-a" nil)))
+      (is (false? (same-id? nil nil))
+          "two nameless entries are not the same entry"))))
+
+(deftest entry-id-reads-the-identity-fields-in-precedence-order
+  ;; A settings entry names itself `:id`; a binding names the same thing
+  ;; `:connection-id` or `:model-entry-id`.  The matcher has to read either,
+  ;; and it must prefer the explicit `:id` over a display `:name`.
+  (let [entry-id (matcher 'entry-id)]
+    (is (= "conn-a" (entry-id {:id "conn-a"})))
+    (is (= "conn-a" (entry-id {:connection-id "conn-a"})))
+    (is (= "model-a" (entry-id {:model-entry-id "model-a"})))
+    (is (= "model-a" (entry-id {:model-id "model-a"})))
+    (is (= "display" (entry-id {:name "display"})))
+    (testing "an explicit id wins over a display name"
+      (is (= "conn-a" (entry-id {:id "conn-a" :name "display"})))
+      (is (= "conn-a" (entry-id {:connection-id "conn-a" :name "display"}))))
+    (testing "a non-entry carries no identity"
+      (is (nil? (entry-id "conn-a")))
+      (is (nil? (entry-id nil)))
+      (is (nil? (entry-id {}))))))
+
+(deftest matching-entry-finds-one-entry-in-either-collection-shape
+  ;; `:connections` and `:models` arrive as vectors from committed settings and
+  ;; as id-keyed maps from the session-config projection.  A vector-only or
+  ;; map-only lookup reports "no such entry" for the other shape, and the send
+  ;; gate then ignores the declared capability.
+  (let [matching-entry (matcher 'matching-entry)
+        connection {:id "conn-a"
+                    :models [{:id "model-a"
+                              :capabilities {:tools true}}]}
+        entries [connection
+                 {:id "conn-b" :name "display-b" :models []}]]
+    (testing "a vector of entries is searched by id"
+      (is (= connection (matching-entry entries "conn-a")))
+      (is (= "display-b" (:name (matching-entry entries "conn-b"))))
+      (is (= connection (matching-entry entries "conn-a"))
+          "the first entry is not shadowed by the later display-name entry"))
+    (testing "a list is a sequential collection too"
+      (is (= connection (matching-entry (apply list entries) "conn-a"))))
+    (testing "a map keyed by string id"
+      (is (= connection (matching-entry {"conn-a" connection} "conn-a")))
+      (is (= connection (matching-entry {"conn-a" connection} "conn-a"))
+          "repeating the lookup answers the same entry"))
+    (testing "a map keyed by keyword id is reached from a string id"
+      (is (= connection (matching-entry {:conn-a connection} "conn-a"))
+          "the entry's own :id matches, so the key spelling does not matter")
+      (is (= connection (matching-entry {:conn-a connection} :conn-a))
+          "a keyword id also finds a keyword key directly"))
+    (testing "a map entry names its id in the value, not only in the key"
+      (is (= connection (matching-entry {:alias connection} "conn-a"))))
+    (testing "the nested models collection uses the same matcher"
+      (let [models [{:id "model-a" :capabilities {:tools true}}
+                    {:id "model-b" :capabilities {:tools false}}]]
+        (is (= (first models) (matching-entry models "model-a")))
+        (is (= (second models) (matching-entry models "model-b")))))
+    (testing "a miss and an empty collection return nil, not a guess"
+      (is (nil? (matching-entry entries "conn-z")))
+      (is (nil? (matching-entry entries :conn-z)))
+      (is (nil? (matching-entry [] "conn-a")))
+      (is (nil? (matching-entry {} "conn-a")))
+      (is (nil? (matching-entry nil "conn-a")))
+      (is (nil? (matching-entry "conn-a" "conn-a"))
+          "a scalar is not an entry collection"))))
+
+(deftest an-entry-id-spelling-is-not-unified-with-its-keyword-form
+  ;; The `same-id?` docstring says a keyword identity and its string spelling
+  ;; name the same entry, but the predicate compares `(str left)` with
+  ;; `(str right)`, and `(str :conn-a)` is ":conn-a".  A vector entry that
+  ;; carries only `:id "conn-a"` is therefore invisible to a keyword request.
+  ;; This test pins the behavior that exists today; if the spellings are ever
+  ;; unified, these assertions must be inverted rather than deleted, because
+  ;; that is the moment the send gate starts accepting keyword bindings.
+  (let [same-id? (matcher 'same-id?)
+        matching-entry (matcher 'matching-entry)
+        entries [{:id "conn-a"}]]
+    (is (false? (same-id? :conn-a "conn-a"))
+        "a keyword prints with its colon, so the string forms differ")
+    (is (true? (same-id? :conn-a ":conn-a"))
+        "the colon spelling is what the comparison actually matches")
+    (is (nil? (matching-entry entries :conn-a))
+        "a keyword id does not reach a string-keyed vector entry")
+    (is (= {:id "conn-a"} (matching-entry entries "conn-a"))
+        "the string id, which settings documents store, does reach it")))
+
+(deftest current-tools-fact-reads-a-vector-shaped-settings-document
+  ;; This is the regression the three helpers exist for.  A committed settings
+  ;; document keeps `:connections` and `:models` as vectors; the old code read
+  ;; them with `get-in` on a keyword path, so the lookup into a vector returned
+  ;; nil and the declared capability was lost.
+  (let [tools-fact (matcher 'current-tools-fact)
+        config {:connections
+                [{:id "conn-a"
+                  :models [{:id "model-tools"
+                            :capabilities {:tools true}}
+                           {:id "model-plain"
+                            :capabilities {:tools false}}]}]}
+        current-config (constantly config)]
+    (testing "a declared capability is read from a vector entry"
+      (is (= [true :live-model]
+             (tools-fact current-config
+                         {:connection-id "conn-a"
+                          :model-entry-id "model-tools"}
+                         false))))
+    (testing "an explicit no is a fact, not a fallback"
+      (is (= [false :live-model]
+             (tools-fact current-config
+                         {:connection-id "conn-a"
+                          :model-entry-id "model-plain"}
+                         true))))
+    (testing "an unknown entry falls back instead of borrowing another entry"
+      (is (= [true :none]
+             (tools-fact current-config
+                         {:connection-id "conn-a"
+                          :model-entry-id "model-missing"}
+                         true)))
+      (is (= [false :none]
+             (tools-fact current-config
+                         {:connection-id "conn-missing"
+                          :model-entry-id "model-tools"}
+                         false))))))
+
+;; ---------------------------------------------------------------------------
+;; sync heartbeat
+
+(defn- wait-for
+  [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/currentTimeMillis) deadline) false
+        :else (do (Thread/sleep 20) (recur))))))
+
+(defn- heartbeat-gateway
+  "A gateway whose one subscription records the thread that broadcasts.
+
+  The feed, the publish lock and the object registry are the real
+  implementations; only the Sente socket is absent, because this test observes
+  which thread calls the send function and never opens a transport."
+  []
+  (let [events (atom [])
+        gw {:feed (feed/create {:now-fn (constantly "2026-11-14T00:00:00Z")})
+            :stopped? (atom false)
+            :opts {:max-message-bytes (* 1024 1024)}
+            :publish-lock (Object.)
+            :objects (sync-object/create-registry)}]
+    (is (:ok? (gateway/subscribe!
+               gw "browser-1" 1
+               (fn [event]
+                 (swap! events conj
+                        (assoc event
+                               :delivered-by
+                               (.getName (Thread/currentThread)))))))
+        "the observing subscription is live")
+    (reset! events [])
+    (assoc gw :events events)))
+
+(deftest heartbeat-runs-on-its-own-thread-while-a-publish-is-stuck
+  ;; `hc/sync-heartbeat` means "the channel is alive".  It was scheduled on the
+  ;; same single-thread executor as the state publish, so a slow publish
+  ;; starved it: the browser saw no state event and no heartbeat and reported a
+  ;; disconnect while the socket was open.  A publish held open here is
+  ;; exactly that failure, and the heartbeat must still arrive.
+  (let [gw (heartbeat-gateway)
+        publish-entered (promise)
+        release-publish (promise)
+        publish-threads (atom [])
+        system-ref (atom {})
+        heartbeat? (fn [event] (= "hc/sync-heartbeat" (:name event)))
+        await-heartbeat
+        (fn [timeout-ms]
+          (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+            (loop []
+              (cond
+                (some heartbeat? @(:events gw))
+                (first (filter heartbeat? @(:events gw)))
+
+                (> (System/currentTimeMillis) deadline) nil
+                :else (do (Thread/sleep 25) (recur))))))]
+    (with-redefs [registry/list-sessions
+                  ;; Hold the publish inside its state read.  Each call records
+                  ;; its thread so the test can name the executor.
+                  (fn [_ _]
+                    (swap! publish-threads conj (.getName (Thread/currentThread)))
+                    (deliver publish-entered true)
+                    @release-publish
+                    {:status :ok :sessions []})
+                  registry/get-session (fn [_ _] {:status :not-found})]
+      (let [publisher ((var-get #'system/start-publisher)
+                       {:registry {}
+                        :owners (atom {})
+                        :router {:state (atom {})
+                                 :app-gate {:state (constantly
+                                                    {:command-epoch 1})}}
+                        :settings-config (fn [] {:models {} :assistants {}})
+                        :gateway gw
+                        :system-ref system-ref
+                        :components {}
+                        :stop-timeout-ms 20000})]
+        (try
+          (testing "the state publish is stuck inside its state read"
+            (is (= true (deref publish-entered 3000 :publish-never-started))
+                "the publisher reached its read")
+            (is (= ["hc-publisher-1"] @publish-threads)
+                "the publish runs on the publisher executor"))
+          (testing "the heartbeat still arrives on its own thread"
+            (let [heartbeat (await-heartbeat 9000)]
+              (is (some? heartbeat)
+                  "a stuck publish must not silence the heartbeat")
+              (is (str/starts-with? (:delivered-by heartbeat) "hc-heartbeat")
+                  "the heartbeat is broadcast by the dedicated heartbeat thread")
+              (is (not= (first @publish-threads) (:delivered-by heartbeat))
+                  "the heartbeat and the publish do not share one executor")
+              (is (not (realized? release-publish))
+                  "the publish was still blocked when the heartbeat arrived")
+              (is (nil? (:publish-error @system-ref))
+                  "a blocked publish is not reported as a publish failure")))
+          (testing "the queued publish resumes after its read returns"
+            (deliver release-publish {:status :ok :sessions []})
+            (is (wait-for #(> (count @publish-threads) 1) 5000)
+                "the publisher executor resumes once the read returns")
+            (is (nil? (:publish-error @system-ref))))
+          (finally
+            (deliver release-publish {:status :ok :sessions []})
+            (let [stop-result ((:stop! publisher))]
+              (is (true? (:stopped? stop-result))
+                  "the publisher drains its own executor")
+              (Thread/sleep 300)
+              (let [before (count (filter heartbeat? @(:events gw)))]
+                (Thread/sleep 5400)
+                (is (= before (count (filter heartbeat? @(:events gw))))
+                    "stopping the publisher stops the heartbeat; it must not
+                     broadcast into a retired feed")))))))))
