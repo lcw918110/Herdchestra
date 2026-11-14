@@ -59,6 +59,27 @@
      #js [target nonce]))
   nil)
 
+(defn- NoticeExpiryEffect
+  "Reconcile notice expiry timers after every commit.
+
+  Run events append notices straight to the database, so `notify` alone cannot
+  schedule their expiry.  This effect observes the committed stack and asks
+  the mutation namespace to start or cancel timers; it never writes state."
+  [^js js-props]
+  (let [app (.-app js-props)
+        notices (.-notices js-props)]
+    (react/useEffect
+     (fn []
+       (mutations/sync-notice-expiry! app notices)
+       js/undefined)
+     #js [notices])
+    ;; Timers are host resources, not React state: drop them when the shell
+    ;; unmounts so a late callback cannot transact against a dead app.
+    (react/useEffect
+     (fn [] (fn [] (mutations/clear-notice-timers!)))
+     #js []))
+  nil)
+
 (defn- topbar
   [this props]
   (let [connection (:ui/connection props)
@@ -470,10 +491,15 @@
     (session/session-page this props)))
 
 (defn- notices
+  "Compose the shared toast stack.  The stack owns presentation (counts and
+  the bulk close control); the mutations own identity and expiry."
   [this props]
-  (common/notice-stack (:ui/notices props)
-                       (fn [id]
-                         (comp/transact! this [(mutations/dismiss-notice {:id id})]))))
+  (common/notice-stack
+   (:ui/notices props)
+   (fn [id]
+     (comp/transact! this [(mutations/dismiss-notice {:id id})]))
+   (fn []
+     (comp/transact! this [(mutations/dismiss-all-notices {})]))))
 
 (defn workbench-content
   "The responsive shell inside the Framework7 page.
@@ -486,6 +512,9 @@
            (react/createElement FocusEffect
                                 #js {:target (:ui/focus-target props)
                                      :nonce (:ui/focus-seq props)})
+           (react/createElement NoticeExpiryEffect
+                                #js {:app (comp/any->app this)
+                                     :notices (:ui/notices props)})
            (topbar this props)
            (dom/div {:className "wb-body"
                      :data-aux-open (if (:ui/aux-open props) "true" "false")}

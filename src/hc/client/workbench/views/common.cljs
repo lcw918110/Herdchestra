@@ -163,22 +163,46 @@
     (some-> (.getElementById js/document id) (.focus))))
 
 (defn notice-stack
-  [notices on-dismiss]
-  (dom/div {:className "wb-toast-stack" :aria-live "polite"}
-           ;; Keep the visual stack short enough that it cannot grow over the
-           ;; sticky composer/send row.  Older notices remain in state and
-           ;; reappear only if newer ones are dismissed.
-           (for [{:keys [id tone text]} (take-last 3 notices)]
-             (dom/div {:key id
-                       :className "wb-toast"
-                       :data-tone (name (or tone :info))}
-                      (dom/div {:className "wb-spread"}
-                               (dom/span {} text)
-                               (dom/button {:type "button"
-                                            :className "wb-icon-button wb-button-small"
-                                            :aria-label "关闭通知"
-                                            :onClick (fn [_] (on-dismiss id))}
-                                           "×"))))))
+  "Render the toast stack.
+
+  `on-dismiss-all` is optional: callers that do not pass it keep the original
+  single-dismiss behaviour, and no bulk control renders.  A repeated notice
+  carries `:count`; the badge shows it so a de-duplicated toast is not mistaken
+  for one occurrence."
+  ([notices on-dismiss] (notice-stack notices on-dismiss nil))
+  ([notices on-dismiss on-dismiss-all]
+   (dom/div {:className "wb-toast-stack" :aria-live "polite"}
+            ;; Keep the visual stack short enough that it cannot grow over the
+            ;; sticky composer/send row.  Older notices remain in state and
+            ;; reappear only if newer ones are dismissed.
+            (for [{:keys [id tone text count]} (take-last 3 notices)]
+              (dom/div {:key (str id)
+                        :className "wb-toast"
+                        :data-tone (name (or tone :info))}
+                       (dom/div {:className "wb-spread"}
+                                (dom/span {}
+                                          text
+                                          (when (and count (> count 1))
+                                            (dom/span
+                                             {:className "wb-badge"
+                                              :data-tone "neutral"}
+                                             (str "×" count))))
+                                (dom/button {:type "button"
+                                             :className "wb-icon-button wb-button-small"
+                                             :aria-label "关闭通知"
+                                             :onClick (fn [_] (on-dismiss id))}
+                                            "×"))))
+            (when (and on-dismiss-all (seq notices))
+              (dom/div {:className "wb-toast"}
+                       (dom/div {:className "wb-spread"}
+                                (dom/span {}
+                                          (str "共 " (count notices) " 条通知"))
+                                (dom/button
+                                 {:type "button"
+                                  :className "wb-button wb-button-small"
+                                  :aria-label "关闭全部通知"
+                                  :onClick (fn [_] (on-dismiss-all))}
+                                 "全部关闭")))))))
 
 (defn- tab-keydown
   "Move selection and focus with the ARIA tabs arrow-key contract.

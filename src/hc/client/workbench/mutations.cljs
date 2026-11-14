@@ -5,7 +5,8 @@
   receipts live in `hc.client.workbench.commands` and
   `hc.client.workbench.sync-bridge`; this keeps a rejected command from being
   mistaken for a state transition."
-  (:require [com.fulcrologic.fulcro.mutations :as m]
+  (:require [com.fulcrologic.fulcro.components :as comp]
+            [com.fulcrologic.fulcro.mutations :as m]
             [hc.client.conversation.ask :as ask]
             [hc.client.conversation.a11y :as a11y]
             [hc.client.conversation.draft :as draft]
@@ -404,17 +405,135 @@
     (let [{:keys [state]} env]
       (swap! state update-in [:ui/board-expanded swarm-id] not))))
 
+(declare dismiss-notice)
+
+(def notice-auto-dismiss-ms
+  "Delay before an ordinary notice removes itself.
+
+  Danger notices never expire: a failure reason or an undispatched command is
+  evidence the user must still be able to read after the timer would fire."
+  12000)
+
+(def notice-stack-limit
+  "Upper bound on buffered notices.  The shell renders only the newest few;
+  the rest stay queued so dismissing the visible ones reveals older context."
+  20)
+
+(defonce ^:private notice-timers
+  ;; Timer handles are host side effects, not domain state: keeping them out
+  ;; of the Fulcro database leaves the database serializable and testable.
+  (atom {}))
+
+(defn- notice-key
+  "Stable identity for de-duplication.
+
+  A caller may pass `:key`; otherwise tone and text identify the notice.  The
+  legacy `:id` stays the timer/dismiss handle and is never used for dedup, so
+  callers that mint a fresh id per occurrence still collapse."
+  [notice]
+  (or (:key notice) [(:tone notice) (:text notice)]))
+
+(defn- cancel-notice-timer!
+  [id]
+  (when-let [timer (get @notice-timers id)]
+    (js/clearTimeout timer)
+    (swap! notice-timers dissoc id))
+  nil)
+
+(defn- schedule-notice-expiry!
+  "Remove the notice named by ID after the ordinary-notice delay.
+
+  The callback re-enters through the ordinary mutation, and its own timer
+  handle is dropped first, so a manual dismissal always wins the race."
+  [app id]
+  (cancel-notice-timer! id)
+  (swap! notice-timers assoc id
+         (js/setTimeout
+          (fn []
+            (swap! notice-timers dissoc id)
+            (comp/transact! app [(dismiss-notice {:id id})]))
+          notice-auto-dismiss-ms))
+  nil)
+
+(defn clear-notice-timers!
+  "Cancel every pending expiry timer without touching the notices."
+  []
+  (doseq [[_ timer] @notice-timers]
+    (js/clearTimeout timer))
+  (reset! notice-timers {})
+  nil)
+
+(defn sync-notice-expiry!
+  "Align pending expiry timers with NOTICES.
+
+  Run events append notices without going through `notify`, so the shell
+  reconciles after every commit: ordinary notices gain one timer, danger
+  notices never do, and notices that left the stack lose theirs."
+  [app notices]
+  (let [live (->> notices
+                  (remove #(= :danger (:tone %)))
+                  (keep :id)
+                  set)
+        pending (set (keys @notice-timers))]
+    (doseq [id (remove live pending)]
+      (cancel-notice-timer! id))
+    (doseq [id (remove pending live)]
+      (schedule-notice-expiry! app id)))
+  nil)
+
+(defn- add-notice
+  "Append NOTICE or refresh the notice it duplicates.
+
+  A duplicate keeps its existing `:id`, takes the newest text and tone, and
+  moves to the end of the stack with `:count` incremented, so the visible slot
+  follows recency while older buffered notices keep their order."
+  [notices notice]
+  (let [key (notice-key notice)
+        duplicate? (some #(= key (notice-key %)) notices)
+        merged (if duplicate?
+                 (mapv (fn [existing]
+                         (if (= key (notice-key existing))
+                           (-> existing
+                               (merge (dissoc notice :id :count))
+                               (update :count (fnil inc 1)))
+                           existing))
+                       notices)
+                 (conj (vec notices) (assoc notice :count 1)))
+        newest (some (fn [n] (when (= key (notice-key n)) n)) merged)]
+    (->> (conj (filterv #(not= key (notice-key %)) merged) newest)
+         (take-last notice-stack-limit)
+         vec)))
+
 (m/defmutation notify
+  "Queue one notice; a repeated key collapses into a counted slot."
   [{:keys [notice]}]
   (action [env]
-    (let [{:keys [state]} env]
+    (let [{:keys [state app]} env
+          key (notice-key notice)
+          existing (some (fn [n] (when (= key (notice-key n)) n))
+                         (:ui/notices @state))
+          id (or (:id existing) (:id notice) (str "notice-" (random-uuid)))]
       (swap! state update :ui/notices
-             (fn [notices]
-               (vec (take-last 20 (conj (vec (or notices [])) notice))))))))
+             (fn [notices] (add-notice (or notices []) (assoc notice :id id))))
+      ;; A repeat restarts the countdown so the newest occurrence stays
+      ;; readable for the full delay instead of inheriting a nearly expired
+      ;; deadline from the notice it collapsed into.
+      (when (not= :danger (:tone notice))
+        (schedule-notice-expiry! app id))
+      (sync-notice-expiry! app (:ui/notices @state)))))
 
 (m/defmutation dismiss-notice
   [{:keys [id]}]
   (action [env]
     (let [{:keys [state]} env]
+      (cancel-notice-timer! id)
       (swap! state update :ui/notices
              (fn [notices] (filterv #(not= id (:id %)) (or notices [])))))))
+
+(m/defmutation dismiss-all-notices
+  "Clear every queued notice and every pending expiry timer."
+  [_]
+  (action [env]
+    (let [{:keys [state]} env]
+      (clear-notice-timers!)
+      (swap! state assoc :ui/notices []))))
