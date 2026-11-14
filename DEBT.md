@@ -25,14 +25,6 @@
 - **影响**：长流式回合放大持久层写放大；长会话的 Owner 整态 CAS 会越来越慢，最终逼近文档大小/提交成本边界。
 - **建议**：在 dispatch 的末端按时间窗或字节阈值合并相邻 chunk，一次提交一个合并块；为 `:calls`/`:conversation`/`:receipts` 定义显式保留/折叠策略（保留权威回执与未结调用，折叠已结算的细粒度记录），并保留现有按大小的 payload 压缩作为独立层。
 
-## D-41 `/healthz` 的 `session-count` 仍为 O(N) 索引扫描
-
-- **条款**：`RUNNING.md`「健康检查」（`GET /healthz`）与 `AGENTS.md` §8.5 启动健康要求。
-- **缺口**：`src/hc/server/app/system.clj:5566-5580` 与 `5789-5801` 的 `:session-count` 调用 `session-ports/list-session-ids`，返回包含全部会话 ID 的索引文档后取 `count`；这不是常量时间计数。已有测量为 1000 会话约 1.6 ms。
-- **影响**：当前成本可接受，但 `/healthz` 随会话数线性增长；轮询、启动探针与大库会放大读取与内存分配。
-- **建议**：在 `sessions` 分区维护与索引更新同事务的 committed session count，健康端点读取该计数；若继续接受 O(N)，在 `HACK.md` 记录预算、测量口径与超过阈值时的降级为 `:unknown`。
-- **证据**：`src/hc/server/app/system.clj:5566-5580,5789-5801`；`src/hc/server/app/session_persistence.clj:443-445` 返回完整 `:ids`；已有测量为 1000 会话约 1.6 ms。
-
 ## D-47 devops worker 内部的 shell 动作不进 Owner 调用账本
 
 - **条款**：`AGENTS.md` §5.3（未结责任与 `:outcome-unknown` 恢复窗口）、§4.4（`.call` 会话边界）。
