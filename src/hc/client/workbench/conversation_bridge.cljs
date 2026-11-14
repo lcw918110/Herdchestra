@@ -212,14 +212,26 @@
   The snapshot seeds the reducer draft for the send.  If the live draft moved
   on while a stop was in flight, it is restored after the command is queued:
   the captured snapshot is what the server receives, and the newer unsent
-  text survives in the composer."
+  text survives in the composer.
+
+  D-44: SESSION-ID must still be the client's selection.  A create receipt
+  moves the selection to the new session, so a send that was captured for the
+  previous one would otherwise queue against a session the operator has
+  already left — the message lands in the wrong history and the visible draft
+  appears to vanish.  Refuse it and keep the text instead; the operator can
+  send again in the session they are actually looking at."
   [app session-id snapshot]
   (let [db (application/current-state app)
         epoch (bridge/command-epoch-for-session session-id)
+        selected (get db :ui/selected-session-id)
         live (get-in db [:ui/draft session-id])
         live-signature (select-keys live [:text :attachments :quotes])
         snapshot-signature (select-keys snapshot [:text :attachments :quotes])]
     (cond
+      (conversation-state/session-changed? selected session-id)
+      (do (notify! :warn "会话已切换，这条草稿仍留在原会话；请在当前会话重新发送。")
+          {:ok? false :reason :session-changed})
+
       (not (bridge/command-allowed?))
       (do (notify! :warn "尚未与服务器同步，命令不可提交。")
           {:ok? false :reason :connection-not-ready})

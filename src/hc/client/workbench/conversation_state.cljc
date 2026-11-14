@@ -148,6 +148,23 @@
            ;; only in the flat table; conversation commands win by id.
            :ui/command (merge (:ui/command db) commands))))
 
+(defn session-changed?
+  "True when SESSION-ID is no longer the client's selection.
+
+  D-44: a create receipt moves `:ui/selected-session-id` to the new session.
+  A send captured a moment earlier still names the old one, and queuing it
+  there puts the message in a history the operator has left while the visible
+  draft appears to vanish.
+
+  Lives here rather than in the bridge because it is decided by database
+  values alone: no app, no transport, and therefore testable without either.
+  A nil, blank or non-string selection is the first-load state, not a
+  mismatch — only a real, different session id refuses the send."
+  [selected session-id]
+  (boolean (and (string? selected)
+                (not (str/blank? selected))
+                (not= selected session-id))))
+
 (defn apply-actions
   "Apply ACTIONS to the reducer for SESSION-ID, then mirror the result.
 

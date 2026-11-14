@@ -285,3 +285,22 @@
       (is (= {"tone" "dark"} (get-in send [:payload :instruction-values])))
       (is (= 7 (get-in send [:payload :turn-selection-version])))
       (is (true? (get-in send [:payload :temporary-read?]))))))
+
+(deftest a-send-whose-session-was-left-is-refused
+  ;; D-44: a create receipt moves the selection to the new session.  A send
+  ;; captured a moment earlier still names the old one; queuing it there puts
+  ;; the message into a history the operator has left, and the visible draft
+  ;; looks like it vanished.  The guard is pure database state, so it is
+  ;; pinned here rather than through an app whose transport does not decide it.
+  (testing "the same session is not a change"
+    (is (false? (conv-state/session-changed? "s1" "s1"))))
+  (testing "a different selection refuses the stale send"
+    (is (true? (conv-state/session-changed? "s2" "s1")))
+    (is (true? (conv-state/session-changed? "s1" "s2"))))
+  (testing "no client selection yet is first load, not a mismatch"
+    (is (false? (conv-state/session-changed? nil "s1")))
+    (is (false? (conv-state/session-changed? "" "s1"))
+        "an empty selection is not a session id"))
+  (testing "a non-string selection is not an identity"
+    (is (false? (conv-state/session-changed? :s1 "s1"))
+        "selections are session ids; anything else must not refuse a send")))
