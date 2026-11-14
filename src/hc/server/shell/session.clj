@@ -106,9 +106,16 @@
   (if (keyword? k) (name k) (str k)))
 
 (defn- env-map
+  "The environment a managed process runs with.
+
+  The shell's own environment comes first (MSYS2 sets `MSYSTEM` and `PATH` so
+  the right runtime is selected), then the request's `:env` and `:env-refs`
+  overlay it.  A request that explicitly sets a name must win, otherwise a
+  caller could not override what the shell decided."
   [runner request]
   (let [env (:env request)
-        refs (:env-refs request)]
+        refs (:env-refs request)
+        shell-env (or (get-in request [:command-spec :env]) {})]
     (when-not (or (nil? env) (map? env))
       (err/fail! :INVALID_ARGUMENT :invalid-env
                  "Shell :env must be a map of names to non-secret values"
@@ -117,13 +124,16 @@
       (err/fail! :INVALID_ARGUMENT :invalid-env-refs
                  "Shell :env-refs must be a map or sequence of names"
                  {:env-refs refs}))
-    (let [direct (reduce-kv (fn [m k v]
+    (let [shell-direct (reduce-kv (fn [m k v] (assoc m (str k) (str v)))
+                                  {}
+                                  shell-env)
+          direct (reduce-kv (fn [m k v]
                               (when (nil? v)
                                 (err/fail! :INVALID_ARGUMENT :invalid-env
                                            "Shell environment values must not be nil"
                                            {:name (str k)}))
                               (assoc m (env-name k) (str v)))
-                            {}
+                            shell-direct
                             (or env {}))
           ref-pairs (cond
                       (map? refs) (seq refs)

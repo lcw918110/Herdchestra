@@ -291,5 +291,7 @@ clojure -M:test:server -n hc.server.artifacts-app-smoke-test
    调度与 `manage-blob-refs!` 快照读取由应用/备份层负责。
 6. **非 ASCII 下载名**：网关只接受 `[A-Za-z0-9._-]{1,128}`，非 ASCII 名称
    使用 ASCII 回退；原始名称保留在元数据与客户端 `download` 属性中。
-7. **Windows 冒烟未运行**：真实生成冒烟使用 POSIX `sh`；Windows 路径与
-   MSYS2 下的生成/下载链路标 `NOT RUN`。
+7. **Windows 冒烟未运行**：真实生成冒烟使用 POSIX `sh`。`process/command-spec`
+   在 Windows 上会优先使用 MSYS2 bash（见 `HACK.md` §17.31），所以真实
+   MSYS2 下的生成/下载链路现在**有明确入口**，但仍标 `NOT RUN` ——本机没有
+   Windows，`bash.exe` 启动与路径转换均未实测。

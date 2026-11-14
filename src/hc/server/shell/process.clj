@@ -42,24 +42,133 @@
     x
     (Paths/get (str x) empty-string-array)))
 
+;; ---------------------------------------------------------------------------
+;; MSYS2 / UCRT64
+;;
+;; On Windows the managed shell must be the project's own Unix toolchain, not
+;; `cmd.exe`.  A holder running `git`, `grep`, `make` or a test suite needs the
+;; same programs on both platforms, and `cmd.exe /c` can run none of them.
+;;
+;; Detection is explicit because MSYS2 ships several runtimes (MSYS, UCRT64,
+;; CLANG64) whose binaries are not interchangeable: an install is used only
+;; when a bash from the named subsystem is actually present.  When nothing is
+;; found the old `cmd.exe /c` path stays and `shell-environment` reports
+;; `:family :cmd`, so a caller can tell it did not get a Unix shell instead of
+;; assuming the platform promised one.
+
+(def ^:private msys2-roots
+  "Install roots tried in order.  UCRT64 is the runtime this project targets
+  on Windows x64; mixing it with MSYS binaries breaks DLL resolution."
+  ["C:\\msys64" "C:\\tools\\msys64" "D:\\msys64"])
+
+(def ^:private msys2-subsystems
+  ["ucrt64" "clang64" "mingw64" "usr"])
+
+(defn- existing-file
+  [candidate]
+  (let [p (path candidate)]
+    (when (Files/isRegularFile p empty-link-options)
+      p)))
+
+(defn- candidate-bash
+  [root subsystem]
+  (let [bash (str root "\\" subsystem "\\bin\\bash.exe")]
+    (when (existing-file bash)
+      {:bash bash :root root :subsystem subsystem})))
+
+(defn msys2-candidate
+  "The first usable MSYS2 bash as `{:bash :root :subsystem}`, or nil.
+
+  `HC_MSYS2_ROOT` and `HC_MSYS2_BASH` let an installation outside the default
+  roots be named explicitly; the fixed roots are a convenience, not a
+  requirement."
+  []
+  (or (when-let [configured (not-empty (str (System/getenv "HC_MSYS2_ROOT")))]
+        (let [root (str/replace configured #"[\\/]+$" "")]
+          (some #(candidate-bash root %) msys2-subsystems)))
+      (some (fn [root]
+              (some #(candidate-bash root %) msys2-subsystems))
+            msys2-roots)
+      (when-let [configured (not-empty (str (System/getenv "HC_MSYS2_BASH")))]
+        (when (existing-file configured)
+          (let [^Path p (path configured)
+                ^Path bin-dir (.getParent p)
+                ^Path root (.getParent bin-dir)]
+            {:bash configured
+             :root (str root)
+             :subsystem (str/lower-case (str (.getFileName bin-dir)))})))))
+
+(defn- msys2-env
+  "Environment that makes a MSYS2 bash behave the way the project expects.
+
+  `MSYSTEM` selects the runtime, so `PATH` inside bash points at that
+  subsystem rather than at whatever `cmd.exe` happened to inherit.
+  `CHERE_INVOKING` stops bash from changing to `$HOME`, which would silently
+  run the command in the wrong directory."
+  [{:keys [root subsystem]}]
+  (let [msystem (str/upper-case (str subsystem))]
+    {"MSYSTEM" msystem
+     "CHERE_INVOKING" "1"
+     "MSYS2_PATH_TYPE" "inherit"
+     "PATH" (str root "\\" subsystem "\\bin;" (str (System/getenv "PATH")))}))
+
+(defn shell-environment
+  "Describe the shell a string command runs under.
+
+  Returns `{:family :posix|:msys2|:cmd, :program ..., :env ...}`.  Only
+  `:posix` and `:msys2` provide a Unix shell; `:cmd` is the honest fallback and
+  callers that require a Unix toolchain must check `:family` rather than
+  inferring it from the platform."
+  []
+  (cond
+    (not (windows?))
+    {:family :posix :program "/bin/sh"}
+
+    :else
+    (if-let [candidate (msys2-candidate)]
+      {:family :msys2
+       :program (:bash candidate)
+       :env (msys2-env candidate)
+       :root (:root candidate)
+       :subsystem (:subsystem candidate)}
+      {:family :cmd :program "cmd.exe"})))
+
 (defn command-spec
   "Interpret COMMAND once.  Returns
   `{:program :args :command :shell?}` or throws an ordinary rejection."
   [command]
   (cond
     (and (string? command) (not (str/blank? command)))
-    (if (windows?)
-      {:program "cmd.exe"
-       :args ["/c" command]
-       :command ["cmd.exe" "/c" command]
-       :shell? true}
-      (let [program (if (Files/exists (path "/bin/sh") empty-link-options)
-                      "/bin/sh"
-                      "sh")]
+    (let [{:keys [family program env]} (shell-environment)]
+      (case family
+        ;; MSYS2 bash with MSYSTEM/PATH set: the project's Unix toolchain,
+        ;; including its own path translation and signal handling.
+        :msys2
         {:program program
          :args ["-c" command]
          :command [program "-c" command]
-         :shell? true}))
+         :shell? true
+         :shell-family :msys2
+         :env env}
+
+        ;; No Unix shell was found.  `cmd.exe` stays as the honest fallback:
+        ;; the spec requires a Unix toolchain, but pretending to have one
+        ;; would fail later and less clearly.
+        :cmd
+        {:program "cmd.exe"
+         :args ["/c" command]
+         :command ["cmd.exe" "/c" command]
+         :shell? true
+         :shell-family :cmd}
+
+        (let [program (if (Files/exists (path program) empty-link-options)
+                        program
+                        "sh")]
+          {:program program
+           :args ["-c" command]
+           :command [program "-c" command]
+           :shell? true
+           :shell-family :posix})))
 
     (and (vector? command) (seq command))
     (let [parts (vec command)]

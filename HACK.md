@@ -1835,10 +1835,12 @@ Datalevin 1.2.10；含 1000 条会话的临时库。本条关闭 `DEBT.md` D-41�
 - **改法**：`sessions` 分区新增 `:session-count` 文档（`id "sessions"`，
   doc `{:id "sessions" :count n}`），由 `session_persistence` 在
   `commit-session!` / `delete-session!` / `storage/erase-session-derived!`
-  的**同一个 `commit-migration!`** 里与 `:session-index` 一起写入，因此二者
-  同事务：读者要么看到旧的 ids+count 对，要么看到新的，不会读到互相矛盾的
-  组合。健康端点改读 `ports/committed-session-count`（可选能力
-  `SessionCountRead`；适配器不实现时回退为索引长度）。
+  的**同一个 `commit-migration!`** 里与 `:session-index` 一起写入；
+  `storage/restore-state!` 在丢弃派生文档后，也于同一恢复事务里按恢复出的
+  索引重写它。因此索引与计数永远同事务：读者要么看到旧的 ids+count 对，
+  要么看到新的，不会读到互相矛盾的组合。健康端点改读
+  `ports/committed-session-count`（可选能力 `SessionCountRead`；适配器不
+  实现时回退为索引长度）。
 - **数值（修后）**：同一 1000 会话库，`committed-session-count` 中位
   **0.030 ms**（5 次：`0.0676 / 0.0354 / 0.0298 / 0.0256 / 0.0252` ms），
   对照 `list-session-ids` 中位 **0.594 ms**，约 20 倍差距，且不再随会话数
@@ -1850,9 +1852,12 @@ Datalevin 1.2.10；含 1000 条会话的临时库。本条关闭 `DEBT.md` D-41�
 - **阈值与降级**：稳定态没有预算上限；只在两种情况下退化为
   `{:count :unknown}`——计数读取抛异常，或返回非 `:ok` 状态。
   `health/snapshot` 的 `ok?` 不含 `session-count`，故计数不可得时 `/healthz`
-  仍 200、字段完整。旧库（有 `:session-index`、无 `:session-count`）与从
-  备份恢复后（restore 会丢弃并重算派生文档）走「点读索引 + 计 ids 长度」的
-  回退，仍是一次点读，不逐条读会话记录。
+  仍 200、字段完整。**备份恢复**在丢弃派生文档后，于同一
+  `restore-state!` 事务里从恢复出的 `:session-index` 重写 `:session-count`
+  （`restore-session-count-doc`），所以恢复后计数恒等于索引长度；「点读索引
+  + 计 ids 长度」的回退只出现在**旧库**（有 `:session-index`、无
+  `:session-count`）或导出包干脆没有索引的情形，仍是一次点读，不逐条读会话
+  记录。
 - **源码位置**：`src/hc/server/app/session_persistence.clj`（`count-kind`、
   `put-count`、`ports/SessionCountRead`）；`src/hc/server/sessions/ports.clj`
   （`SessionCountRead`、`committed-session-count`）；`src/hc/server/storage.clj`
@@ -1868,9 +1873,59 @@ Datalevin 1.2.10；含 1000 条会话的临时库。本条关闭 `DEBT.md` D-41�
   后计数同步且读计数不物化 id 列表；
   `committed-session-count-falls-back-to-a-legacy-index` 断言无计数文档时回退；
   `healthz-degrades-a-failed-session-count-to-unknown` 让计数点读抛错后断言
-  `/healthz` 仍 200 且 `:sessions {:count :unknown}`。
+  `/healthz` 仍 200 且 `:sessions {:count :unknown}`。恢复路径的断言在
+  `hc.server.app.session-command-index-test` 的
+  `a-restore-rewrites-the-count-from-the-restored-index-test`：
+  ```bash
+  clojure -M:dev:server -e \
+    "(require 'hc.server.app.session-command-index-test) (clojure.test/run-tests 'hc.server.app.session-command-index-test)"
+  ```
+  它断言 restore 后计数文档与索引长度一致。
 - **适用范围**：任何以会话数为诊断字段的只读探针；新增派生计数文档必须与
   其权威索引同事务提交，否则计数会漂移。
+
+### 17.31 Windows 托管 shell 走 MSYS2 bash，而非 `cmd.exe`（2026-11-14）
+
+`[CODE FACT，Windows 分支未在 Windows 上运行]` 环境：macOS 25.6.0 / arm64
+（只能验证非 Windows 分支与纯函数）。本条关闭 `DEBT.md` D-31。
+
+- **现象（修前）**：`process/command-spec` 的 Windows 分支把字符串命令交给
+  `cmd.exe /c`。holder 与 Plan dedicated worker 因此拿不到项目的 Unix 工具
+  链：`git`、`grep`、`make`、测试套件在 `cmd.exe` 下要么不存在，要么是另一
+  套语义（路径分隔符、信号、退出码）。
+- **改法**：`command-spec` 改为查 `shell-environment`，后者返回
+  `{:family :posix|:msys2|:cmd, :program :env ...}`。发现 MSYS2 bash 时用它
+  并注入 `MSYSTEM=<UCRT64 等>`、`CHERE_INVOKING=1`、`MSYS2_PATH_TYPE=inherit`
+  与指向该子系统 `bin` 的 `PATH`；没有 bash 时保留 `cmd.exe /c`，但
+  `:shell-family :cmd` 让调用方能看出自己没拿到 Unix shell。
+- **探测顺序**：`HC_MSYS2_ROOT`（显式指定根）→ `C:\msys64`、
+  `C:\tools\msys64`、`D:\msys64` → 每根下按 `ucrt64`、`clang64`、`mingw64`、
+  `usr` 依次查找 `bin\bash.exe`；最后 `HC_MSYS2_BASH` 允许直接指向一个
+  bash。子系统按此顺序优先，是因为 MSYS 与 UCRT64 的二进制不可互换，混用会
+  破坏 DLL 解析。
+- **环境合并**：`session/env-map` 先铺 shell 自己的 env，再叠请求的 `:env`
+  与 `:env-refs`。请求显式设置的名字必须赢，否则调用方无法覆盖 shell 的
+  选择。
+- **未验证范围**：Windows 上的真实 `bash.exe` 启动、路径转换（`C:\...`
+  在 bash 里的 `/c/...` 形式）与信号语义均 **NOT RUN**——本机无 Windows。
+  已验证的是：非 Windows 分支仍为 `:posix` 且 `/bin/sh` 可执行；纯函数
+  `msys2-candidate` 在无 MSYS2 安装时不虚构候选；`env-map` 的叠加顺序。
+- **代价**：Windows 上若既无 MSYS2 又无显式配置，行为仍是旧的 `cmd.exe`，
+  spec 要求的 Unix 工具链依然缺席。这是诚实回退，不是修复完成；需要真正
+  使用的环境必须装 MSYS2 或设 `HC_MSYS2_ROOT`/`HC_MSYS2_BASH`。
+- **源码位置**：`src/hc/server/shell/process.clj`（`msys2-roots`、
+  `msys2-subsystems`、`msys2-candidate`、`msys2-env`、`shell-environment`、
+  `command-spec`）；`src/hc/server/shell/session.clj`（`env-map`）。
+- **复检命令**：
+  ```bash
+  clojure -M:dev:server -e \
+    "(require 'hc.server.shell.process-test) (clojure.test/run-tests 'hc.server.shell.process-test)"
+  ```
+  其中 `string-command-names-its-shell-family` 断言每个字符串命令都声明
+  `:shell-family`，且非 Windows 上确为 `:posix`。Windows 行为需在 Windows
+  机器上另跑一次冒烟后才能把本条从「部分验证」升级。
+- **适用范围**：所有经 `process/command-spec` 的字符串命令；vector 与
+  `{:program :args}` 形式本就不经 shell，不受影响。
 
 ## 18 E2E 06 的 fixture 依赖 Pillow 与跨平台字体（2026-11-11）
 

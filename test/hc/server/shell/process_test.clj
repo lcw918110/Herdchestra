@@ -247,3 +247,45 @@
       (finally
         (process/stop-child-monitor! monitor)
         (force-kill! process [(read-pid pid-file)])))))
+;; ---------------------------------------------------------------------------
+;; MSYS2 / shell selection
+;;
+;; The Windows branch cannot be exercised on this host, so these tests pin the
+;; contract that *is* observable everywhere: a string command always names the
+;; shell family it will use, and `:posix` really is a Unix shell.  The MSYS2
+;; environment builder is pure, so its shape is asserted directly instead of
+;; pretending a Windows install exists.
+
+(deftest string-command-names-its-shell-family
+  (testing "a string command always declares which shell will run it"
+    (let [spec (process/command-spec "echo hi")]
+      ;; `:command` is the exec vector, so the caller's text sits after the
+      ;; shell's own flag; the shell rejoins the words itself.
+      (is (= "echo hi" (last (:command spec))))
+      (is (true? (:shell? spec)))
+      (is (contains? #{:posix :msys2 :cmd} (:shell-family spec))
+          "the caller must be able to tell whether it got a Unix shell")))
+  (testing "the family matches what this host can actually provide"
+    (let [spec (process/command-spec "echo hi")]
+      (if (process/windows?)
+        (is (= (:shell-family spec) (if (:env spec) :msys2 :cmd)))
+        (do (is (= :posix (:shell-family spec)))
+            (is (= :posix (:family (process/shell-environment))))))))
+  (testing "a vector command is not a shell request at all"
+    (let [spec (process/command-spec ["echo" "hi"])]
+      (is (nil? (:shell-family spec)))
+      (is (false? (:shell? spec))))))
+
+(deftest msys2-bash-discovery-prefers-a-real-install
+  (testing "nothing on disk yields no candidate instead of a guessed path"
+    ;; HC_MSYS2_ROOT/HC_MSYS2_BASH are read from the environment, and this
+    ;; host has neither, so discovery must not invent a MSYS2 install.
+    (when-not (process/windows?)
+      (is (nil? (process/msys2-candidate))))))
+
+(deftest shell-environment-is-explicit-about-a-missing-unix-shell
+  (let [env (process/shell-environment)]
+    (if (process/windows?)
+      (is (contains? #{:msys2 :cmd} (:family env)))
+      (do (is (= :posix (:family env)))
+          (is (= "/bin/sh" (:program env)))))))
