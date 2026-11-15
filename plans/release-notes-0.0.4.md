@@ -90,8 +90,9 @@
 
 | 项目 | 结果 |
 |---|---|
-| 全量 JVM（四 shard，`scripts/test-sharded.sh`） | 428 namespaces / 4604 tests / 33871 assertions，0 failures / 0 errors；PRE_HASH = POST_HASH |
-| `verify:js`（26 脚本） | passed=25 failed=0 |
+| 全量 JVM（四 shard，`scripts/test-sharded.sh`） | 428 namespaces / 4604 tests / 33906 assertions，0 failures / 0 errors；PRE_HASH = POST_HASH |
+| CLJS DOM gate（`scripts/test-cljs-gate.sh`） | 27 harness 全部 exit=0 |
+| `verify:js`（26 脚本，默认排除浏览器项） | passed=25 failed=0 |
 | E2E 11（记忆候选/归档/临时会话） | 31/31 checks，`ok: true` |
 | E2E 19（键盘/200% 字号/输入法/焦点/AX 树） | 20/20 checks，`ok: true` |
 | 全量 22 条 E2E | 见 `plans/e2e-master-status-0.0.4.md` |
