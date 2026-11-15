@@ -101,7 +101,10 @@ declare -A SHARD_NSES=()
 validate_shard() {
   local shard="$1" nses count
   nses="$(shard_nses "$shard")" || exit 2
-  count="$(printf '%s' "$nses" | tr -d '[]' | wc -w)"
+  # `wc -w` pads its output when the input spans several lines, and a
+  # namespace list always does.  The release gate reads this count as an
+  # unsigned integer, so strip the padding here rather than at every reader.
+  count="$(printf '%s' "$nses" | tr -d '[]' | wc -w | tr -d '[:space:]')"
   if [ "$count" -le 0 ]; then
     echo "shard '$shard' in $SHARDS_EDN has no namespaces; refusing to run" >&2
     exit 2
@@ -195,7 +198,8 @@ run_shard() {
     exit 2
   fi
   local ns_count
-  ns_count="$(printf '%s' "$nses" | tr -d '[]' | wc -w)"
+  ns_count="$(printf '%s' "$nses" | tr -d '[]' | wc -w | tr -d '[:space:]')"
+
   local log="$OUT_DIR/shard-$shard.log"
   local marker="hc-shard-$shard"
   echo "[shard $shard] nses: $ns_count namespaces"
