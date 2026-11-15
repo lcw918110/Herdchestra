@@ -276,9 +276,15 @@
                        :message "the session index could not be listed"
                        :details {:status (:status listed)}})})))
     (catch Throwable t
+      ;; The caller must tell a failing store from a broken index.  Keep the
+      ;; exception's own data, or its class, under :details :cause so the lower
+      ;; context survives instead of being replaced by one flat code.
       {:status :unknown
        :error {:code :SESSION_COUNT_UNAVAILABLE
-               :message (or (ex-message t) "the session count could not be read")}})))
+               :message (or (ex-message t) "the session count could not be read")
+               :details {:cause (or (ex-data t)
+                                    {:class (.getName (class t))
+                                     :message (ex-message t)})}}})))
 
 (defn- commit-error
   [message data]

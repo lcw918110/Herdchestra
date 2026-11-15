@@ -152,9 +152,16 @@
   (try
     ((:start! ledger) entry)
     (catch Throwable error
+      ;; A ledger write fails for reasons the operator must tell apart: a
+      ;; closed store, a rejected transaction, a bug in the ledger itself.
+      ;; Keep the lower class and data under :details :cause instead of
+      ;; collapsing them into one flat code.
       {:ok? false
        :error {:code :WORKER_CALL_LEDGER_FAILED
-               :message (or (.getMessage error) (str error))}})))
+               :message (or (.getMessage error) (str error))
+               :details {:cause (or (ex-data error)
+                                    {:class (.getName (class error))
+                                     :message (ex-message error)})}}})))
 
 (defn- ledger-finish!
   "Settle one ledger record.  A failure here is never a helper failure: the
