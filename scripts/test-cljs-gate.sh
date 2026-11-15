@@ -21,6 +21,21 @@ set -u -o pipefail
 
 cd "$(dirname "$0")/.."
 
+# Every harness below shells out to a bare `clojure` (cljs.main, shadow-cljs)
+# or a bare `node`.  This repository does not require a system Clojure: Pixi
+# supplies it under .pixi/envs/default/bin.  Prepending that directory here is
+# the single place the whole gate inherits it, so a harness never has to carry
+# its own copy.  verify_all.sh and verify_negative_gate.sh do the same for the
+# same reason; keeping the shape identical makes the three easy to compare.
+#
+# Without this, a host with no system `clojure` reports exit 127 for every
+# harness, which is indistinguishable from a real test failure at the summary
+# line.
+if [ -d ".pixi/envs/default/bin" ]; then
+  PATH="$PWD/.pixi/envs/default/bin:$PATH"
+  export PATH
+fi
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_ROOT="${CLJS_GATE_LOG_ROOT:-target/cljs-gate/$STAMP}"
 mkdir -p "$LOG_ROOT"
