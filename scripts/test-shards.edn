@@ -130,12 +130,17 @@
   hc.compose.owner.mailbox-test
   hc.compose.owner.multi-client-test
   hc.compose.owner.report-integration-test
+  hc.compose.owner.run-settled-census-test
+  hc.compose.owner.run-shrink-contract-test
+  hc.compose.owner.run-text-window-test
   hc.compose.owner.runtime-property-test
   hc.compose.owner.runtime-test
   hc.compose.owner.scope-state-test
   hc.compose.owner.session-run-bridge-test
   hc.compose.owner.stop-command-test
+  hc.compose.owner.store-compaction-test
   hc.compose.owner.store-test
+  hc.compose.owner.stream-buffer-test
   hc.compose.owner.tasks-property-test
   hc.compose.owner.tasks-test
   hc.compose.owner.terminal-contract-test
@@ -203,6 +208,7 @@
   hc.invariants-coverage-test
   hc.server.app.assistant-default-test
   hc.server.app.background-loops-test
+  hc.server.app.baseline-window-with-owners-test
   hc.server.app.cancel-hook-test
   hc.server.app.commands-dedup-test
   hc.server.app.commands-test
@@ -211,6 +217,7 @@
   hc.server.app.devops-integration-test
   hc.server.app.devops-owner-integration-test
   hc.server.app.devops-test
+  hc.server.app.devops-worker-call-ledger-test
   hc.server.app.effect-fingerprint-consistency-test
   hc.server.app.executors-test
   hc.server.app.extension-scope-test
@@ -420,6 +427,7 @@
   hc.server.sessions.sessions-test
   hc.server.shell-owner-port-test
   hc.server.shell-test
+  hc.server.shell.process-test
   hc.server.speech.audio-test
   hc.server.speech.config-test
   hc.server.speech.loopback-test
