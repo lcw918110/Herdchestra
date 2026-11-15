@@ -18,7 +18,8 @@
   identify the original.  Backup/export and forensic readers use it when they
   need the full text.  A restored state must be compacted again before it is
   committed, or the document grows back to its uncompacted size."
-  (:require [clojure.edn :as edn])
+  (:require [clojure.edn :as edn]
+            [hc.compose.owner.state :as state])
   (:import (java.nio.charset StandardCharsets)
            (java.security MessageDigest)))
 
@@ -189,44 +190,55 @@
   ([state store measured-before]
    (compact-state state store measured-before {}))
   ([state store measured-before {:keys [measure?] :or {measure? true}}]
-   (if-not (and store (:put! store))
-     [state {:before (or measured-before 0)
-             :after (or measured-before 0)
-             :saved 0
-             :refs 0
-             :skipped? true}]
-     (let [before (when measure?
-                    (or measured-before (count (pr-str state))))
-           state' (-> state
-                      (update :calls
-                              (fn [calls]
-                                (into {} (map (fn [[k v]] [k (compact-call store v)])
-                                              calls))))
-                      (update :cancel
-                              (fn [cancel]
-                                (if (map? cancel)
-                                  (update cancel :nodes
-                                          (fn [nodes]
-                                            (into {} (map (fn [[k v]]
-                                                            [k (compact-value store v)])
-                                                          nodes))))
-                                  cancel)))
-                      (update :runs
-                              (fn [runs]
-                                (into {} (map (fn [[k v]]
-                                                [k (compact-value store v)])
-                                              runs)))))]
-       ;; Sizing the document costs two full `pr-str` passes, which is the
-       ;; single most expensive thing this function can do.  The commit path
-       ;; only needs the compacted state, not its measured size, so it opts
-       ;; out and pays nothing for statistics it never reads.
-       (if measure?
-         (let [after (count (pr-str state'))]
-           [state' {:before before
-                    :after after
-                    :saved (max 0 (- before after))
-                    :refs (if-let [c (:count store)] (c) 0)}])
-         [state' {:refs (if-let [c (:count store)] (c) 0)}])))))
+   ;; The settled-run shrink needs no blob store: it drops fields rather than
+   ;; externalising them.  It therefore runs before the store check, so a
+   ;; session whose blob store is unavailable still stops accumulating
+   ;; dormant provenance.  It also runs before `compact-value` touches the
+   ;; same records, so a dropped field is never externalised first.
+   ;;
+   ;; `:before` measures the state as the caller holds it, not the shrunk
+   ;; one.  A caller that measured the document to decide whether to compact
+   ;; must see its own number back, or `:saved` stops accounting for what
+   ;; this function changed.  The shrink counts toward what it saved.
+   (let [before (when measure?
+                  (or measured-before (count (pr-str state))))
+         state (state/shrink-settled-runs state)]
+     (if-not (and store (:put! store))
+       [state {:before (or before 0)
+               :after (or before 0)
+               :saved 0
+               :refs 0
+               :skipped? true}]
+       (let [state' (-> state
+                        (update :calls
+                                (fn [calls]
+                                  (into {} (map (fn [[k v]] [k (compact-call store v)])
+                                                calls))))
+                        (update :cancel
+                                (fn [cancel]
+                                  (if (map? cancel)
+                                    (update cancel :nodes
+                                            (fn [nodes]
+                                              (into {} (map (fn [[k v]]
+                                                              [k (compact-value store v)])
+                                                            nodes))))
+                                    cancel)))
+                        (update :runs
+                                (fn [runs]
+                                  (into {} (map (fn [[k v]]
+                                                  [k (compact-value store v)])
+                                                runs)))))]
+         ;; Sizing the document costs two full `pr-str` passes, which is the
+         ;; single most expensive thing this function can do.  The commit path
+         ;; only needs the compacted state, not its measured size, so it opts
+         ;; out and pays nothing for statistics it never reads.
+         (if measure?
+           (let [after (count (pr-str state'))]
+             [state' {:before before
+                      :after after
+                      :saved (max 0 (- before after))
+                      :refs (if-let [c (:count store)] (c) 0)}])
+           [state' {:refs (if-let [c (:count store)] (c) 0)}]))))))
 
 (defn- source-reference?
   [value]

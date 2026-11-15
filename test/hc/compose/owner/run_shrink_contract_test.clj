@@ -124,3 +124,78 @@
                  (state/start-run call attempt 1000))]
       (is (= :started (get-in st [:runs rid :status])))
       (is (false? (state/conversation-stable? st))))))
+
+;; ---------------------------------------------------------------------------
+;; The contract above pins what a shrink must PRESERVE.  These pin what it
+;; must DO, so an implementation that quietly stops shrinking fails loudly
+;; instead of passing every preservation assertion by doing nothing.
+
+(deftest a-settled-run-keeps-only-the-settled-keys
+  (let [st (state/shrink-settled-runs (session-with-runs 3))
+        settled (finished-runs st)]
+    (is (= 3 (count settled)) "the runs are still there")
+    (doseq [[id run] settled]
+      (testing (str "run " id)
+        (is (empty? (remove (set state/settled-run-keys) (keys run)))
+            "a settled run holds no key outside the settled set")
+        (is (contains? run :text-length)
+            ":text-length is always present after the shrink, so a run inside
+             its retention window answers its length too")
+        (is (not (contains? run :role)) ":role is provenance the call still holds")
+        (is (not (contains? run :context)) ":context is provenance")
+        (is (not (contains? run :tool-call-ids))
+            "the ids are replaced by :had-tools?")))))
+(deftest shrinking-preserves-the-bit-that-tool-policy-reads
+  (let [st (session-with-runs 2)
+        [rid _] (first (finished-runs st))
+        no-tools (state/shrink-settled-runs st)
+        with-tools (state/shrink-settled-runs
+                    (assoc-in st [:runs rid :tool-call-ids] ["tool-1" "tool-2"]))]
+    (is (false? (get-in no-tools [:runs rid :had-tools?]))
+        "a run that invoked nothing reads false")
+    (is (true? (get-in with-tools [:runs rid :had-tools?]))
+        "a run that invoked tools reads true, which is all the policy asks")))
+
+(deftest shrinking-a-live-run-is-a-no-op
+  (let [st (session-with-runs 2)
+        [st call] (state/create-call
+                   st {:kind :model :role :plan :lane :plan :agent-id :plan
+                       :request {:snapshot {:messages []}}})
+        attempt :attempt-live
+        call (assoc call :state :running :attempt-id attempt
+                    :context {:attempt-id attempt} :context-attempt-id attempt)
+        rid (state/run-id (:call-id call) attempt)
+        st (-> st
+               (state/put-call call)
+               (state/add-attempt-node call attempt)
+               (state/start-run call attempt 1000)
+               (state/append-run-text rid "streaming" 1001))
+        shrunk (state/shrink-settled-runs st)]
+    (is (= (get-in st [:runs rid]) (get-in shrunk [:runs rid]))
+        "a live run is returned untouched; it still holds :role and :context")
+    (is (= "streaming" (get-in shrunk [:runs rid :text])))))
+
+(deftest shrinking-is-idempotent
+  (let [once (state/shrink-settled-runs (session-with-runs 3))
+        twice (state/shrink-settled-runs once)]
+    (is (= once twice) "a second pass changes nothing")))
+
+(deftest shrinking-composes-with-text-collapse
+  (let [window 2
+        st (-> (session-with-runs 5)
+               (state/collapse-run-text window)
+               (state/shrink-settled-runs))
+        finished (sort-by (fn [[_ run]] (- (long (:finished-at run))))
+                          (finished-runs st))
+        newest (take window finished)
+        oldest (take-last 3 finished)]
+    (testing "the text window still holds after the shrink"
+      (doseq [[_ run] newest]
+        (is (string? (:text run))))
+      (doseq [[_ run] oldest]
+        (is (nil? (:text run)))
+        (is (pos? (long (or (:text-length run) 0))))))
+    (testing "and every settled run is shrunk regardless of its text"
+      (doseq [[id run] finished]
+        (is (empty? (remove (set state/settled-run-keys) (keys run)))
+            (str "run " id " holds nothing outside the settled set"))))))
