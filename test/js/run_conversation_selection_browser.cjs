@@ -94,13 +94,33 @@ function fail(message) {
   throw new Error(message);
 }
 
+// Playwright's own bundled Chromium is not installed in this repository, so the
+// launch target is a system browser.  Probe the same candidate list that
+// verify_browser_ui.cjs already uses instead of hardcoding one Linux path: a
+// macOS host has no /usr/bin/google-chrome and would otherwise fail with
+// "executable doesn't exist" even though the build and the test are healthy.
+// HC_CHROME / CHROME_PATH still win, so CI keeps full control.
+const CHROME_CANDIDATES = [
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+];
+const chromeExe =
+  process.env.HC_CHROME ||
+  process.env.CHROME_PATH ||
+  CHROME_CANDIDATES.find((p) => fs.existsSync(p)) ||
+  "/usr/bin/google-chrome";
+
 (async () => {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   let browser = null;
   try {
     browser = await chromium.launch({
-      executablePath: process.env.HC_CHROME || "/usr/bin/google-chrome",
+      executablePath: chromeExe,
       headless: true,
       args: ["--no-sandbox", "--disable-gpu"],
     });
