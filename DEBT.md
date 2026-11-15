@@ -38,3 +38,13 @@
 - **建议方向**：若将来确实要压这条路径，唯一可行方向是**消除 digest**（例如用文档版本号 + 修改计数替代内容哈希），但那是削弱幂等判据，属于协议变更而非优化，必须单独立项。
 - **已排除的做法**：不能把 `canonical-form` 的比较器换成 `compare`。实测 `(sort compare [:b "a" :a "b" :c "B"])` 直接抛 `ClassCastException`——`compare` 无法比较 `Keyword` 与 `String`。`pr-str` 比较器不是冗余，它是唯一能对混合 key 类型给出全序的办法；Owner 状态的 key 实测只有 `String` 与 `Keyword` 两种，正好落在 `compare` 办不到的区间。而且它的排序结果（String 在前、Keyword 在后）已经是 digest 的一部分，换掉会改变所有已存数据的 digest，破坏幂等比对。**这一项不是缺陷，是正确设计。** 因此 D-48 的可优化空间只剩「大小检查与 digest 复用同一次序列化」，上限约 14%（大小检查占 1.12/8.11 ms）。
 - **触发条件**：任何会话进入 300 轮以上，或单次提交观测到超过 50 ms。
+
+## D-51 测试清单靠手工维护，无生成器，已漂移过八项
+
+- **条款**：`AGENTS.md` §8.2（属性测试与不变量）、§8.4（三层验证模型）与 §8.5（E2E 与放行基准）。
+- **缺口**：`scripts/test-sharded.sh` 的头部注释写明 shard 清单 "generated from every `test/*_test.clj` file"，但仓库里没有任何生成器。`scripts/final-gate.sh:227` 与 `:378` 只**读取**并**哈希**该文件，不重建它。清单因此是手工维护的，并在 0.0.3 之后漂移：实测 428 个测试文件里只有 420 个被登记，8 个测试从未进入四 shard runner。
+- **已关闭的部分**：`663f28a` 补齐了这 8 项（`run-settled-census`、`run-shrink-contract`、`run-text-window`、`store-compaction`、`stream-buffer`、`baseline-window-with-owners`、`devops-worker-call-ledger`、`shell.process`），并按命名空间的邻居归入 A/B/D，而不是追加到末尾。补齐后 428/428 一一对应，无 stale、无重复，EDN 解析正常（A 169 / B 93 / C 23 / D 143）。
+- **为什么这条仍留在 DEBT**：补齐是一次性的，缺陷是结构性的。下一轮再加测试文件仍会漏，而漏掉的后果不是「少跑一点」——`release-gate.sh` 第 5 步是全套唯一的运行入口，它完全信任这份清单。**一个未登记且通过的测试，与一个登记且通过的测试，对门禁而言输出完全相同。** 本轮最有价值的两个断言（D-50 背后的 id 稳定性契约、D-49 背后的缩身契约）就长期待在这个盲区里，门禁一路绿。
+- **不建议的做法**：不要只加一条「记得更新清单」的注释。注释不会失败，漂移正是注释失效的结果。也不要让 runner 直接 `require` 磁盘上的全部 `hc.*-test` 命名空间——那会把一个 helper 的笔误从「静默跳过」升级为「整 shard 崩溃」，方向正确但那是设计变更，须同时定义「清单外命名空间加载失败」的语义。
+- **建议方向**：把清单改为生成产物，并在两处**强制**：其一，`release-gate.sh` 第 5 步在跑 shard 前重建清单，只要与工作树里的版本不同就判失败（漂移当场暴露，而不是下一轮才发现）；其二，`final-gate.sh` 现有的 `test-shards.edn` 哈希校验改为对「重建结果」取哈希，使手工编辑立刻失效。生成时须显式排除 `support`、`fake_port`、`smoke` 等 helper 命名空间，这与现有 runner「helper 永不 require」的约定一致。
+- **触发条件**：已触发。任何新增 `test/**/*_test.clj{,c}` 的提交都应先确认清单已同步；`663f28a` 之前长期未满足。
