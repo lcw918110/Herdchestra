@@ -90,7 +90,7 @@
 
 | 项目 | 结果 |
 |---|---|
-| 全量 JVM（`clojure -X:test:compose:server:client`） | 4502 tests / 33065 assertions，0 failures / 0 errors |
+| 全量 JVM（四 shard，`scripts/test-sharded.sh`） | 428 namespaces / 4604 tests / 33871 assertions，0 failures / 0 errors；PRE_HASH = POST_HASH |
 | `verify:js`（26 脚本） | passed=25 failed=0 |
 | E2E 11（记忆候选/归档/临时会话） | 31/31 checks，`ok: true` |
 | E2E 19（键盘/200% 字号/输入法/焦点/AX 树） | 20/20 checks，`ok: true` |
@@ -98,17 +98,10 @@
 
 ## 已知边界
 
-见 `RUNNING.md` 的「已知边界」，以及 `DEBT.md` 中仍未关闭的条目。以下与 E2E 相关但不阻塞本轮判定：
+见 `RUNNING.md` 的「已知边界」（产品侧能力边界，稳定）与 `DEBT.md`（尚未关闭的实现缺口）。`DEBT.md` 采「关闭即删除」政策、编号不复用，所以下面的引用会随修复消失；未列出的编号表示已关闭，历史见 git 记录。
 
-- **D-44** 新建会话后立即发送存在回执竞态；产品侧仍无门控，E2E 用显式等待绕开。
-- **D-45** WebM 时长字段未实现。
-- **D-46** E2E 21 的哈希口径与实际计价口径不一致。
-- **D-47** devops worker 的 shell 不进 Owner 账本。
-- **D-48** `:settle-ms` 未随 `:stop-grace-ms` 收敛。
-- **D-49** 通知永不过期，只能逐条手动关闭。
-- **D-50** 右上角控件缺少遮挡防护的测试约束。
-- **D-51** 发送被拒时只有草稿留在框里，界面不说明原因。
-- **D-52** `:duplicate` 与快照路径的语义冲突没有测试固定。
-- **D-53**（已收窄）材料页不显示它服务哪个会话。重新对齐与拒绝诊断已在本版第 6 条修复；只剩「视图显示会话身份」一项。
+本版剩下的缺口共三条，都不阻塞本轮发布：
 
-D-54（`cross-session?` 静默丢弃）已在本版第 6 条关闭。
+- **D-37** `:conversation` 随会话线性增长且无上限。它不是重复副本——每条消息原文都是唯一副本，且 `sealed-scope-view` 要在任意位置定位 reset beat，`mirror-history-message!` 要随机访问任意旧消息。要动它必须先锁死五个前提（sealed view 回溯上界、归档 blob 随机可读性、下标连续性、Pair-Hint 投影不变、归档触发可观测性），见 `plans/D-37-retention-census.md` §8。前缀归档已实测失效：砍掉前 40 条后 `reset-0`/`reset-9` 探针在保留段里查不到。其余分区（`:calls` 快照、`:runs` 正文、`:runs` 休眠元数据、流式 chunk）均已关闭。
+- **D-48** 存储层 `normalize` 把同一文档序列化三次。已确认无廉价优化空间：两处序列化的对象不同（单个 `put` 条目 vs 整个 migration map），字节之间没有位置关系，无法合并。唯一剩余方向是删掉 digest，那属于协议变更而非优化。
+- **D-51** 测试清单 `scripts/test-sharded.edn` 靠手工维护，没有生成器。本版补齐了 8 个从未被四 shard runner 执行的测试文件（428/428 一一对应），但缺陷是结构性的：`release-gate` 第 5 步完全信任这份清单，一个未登记且通过的测试与一个登记且通过的测试对门禁输出完全相同。建议方向是在第 5 步重建清单并比对。
